@@ -62,6 +62,10 @@ docker compose up -d --build
 docker compose logs -f app
 ```
 
+في الإنتاج يستخدم البوت Telegram Webhook على
+`/telegram/<WEBHOOK_SECRET_PATH>`، ولذلك تستيقظ خدمة الاستضافة عند وصول رسالة.
+في التطوير المحلي فقط يستخدم البوت long polling.
+
 يوجّه Docker المنفذ إلى `127.0.0.1:8000`. ضع أمامه Caddy أو Nginx مع HTTPS، واضبط `PUBLIC_BASE_URL` على النطاق العام.
 
 ## إعداد المتجر من لوحة الأدمن
