@@ -5,7 +5,8 @@ import contextlib
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from aiogram.types import Update
+from fastapi import FastAPI, Header, HTTPException
 
 from app.bootstrap import seed_defaults
 from app.bot import build_bot, build_dispatcher
@@ -134,7 +135,14 @@ async def lifespan(app: FastAPI):
         worker_loop(processor, settings.order_worker_interval_seconds),
         name="order-worker",
     )
-    if bot and dispatcher:
+    if bot and dispatcher and settings.is_production:
+        webhook_secret = settings.webhook_secret_path.get_secret_value()
+        await bot.set_webhook(
+            f"{settings.public_base_url}/telegram/{webhook_secret}",
+            secret_token=webhook_secret,
+            allowed_updates=dispatcher.resolve_used_update_types(),
+        )
+    elif bot and dispatcher:
         polling_task = asyncio.create_task(
             dispatcher.start_polling(bot, handle_signals=False), name="telegram-polling"
         )
@@ -147,6 +155,7 @@ async def lifespan(app: FastAPI):
     app.state.order_service = order_service
     app.state.binance = binance
     app.state.bot = bot
+    app.state.dispatcher = dispatcher
 
     try:
         yield
@@ -178,3 +187,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(web_router)
+
+
+@app.post("/telegram/{path_secret}", include_in_schema=False)
+async def telegram_webhook(
+    path_secret: str,
+    update: Update,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> dict[str, bool]:
+    settings = app.state.settings
+    expected = settings.webhook_secret_path.get_secret_value()
+    if path_secret != expected or x_telegram_bot_api_secret_token != expected:
+        raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+    bot = app.state.bot
+    dispatcher = app.state.dispatcher
+    if bot is None or dispatcher is None:
+        raise HTTPException(status_code=503, detail="Telegram bot is not configured")
+    await dispatcher.feed_update(bot, update)
+    return {"ok": True}
