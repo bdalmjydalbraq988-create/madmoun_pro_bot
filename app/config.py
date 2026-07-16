@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     webhook_secret_path: SecretStr = SecretStr("change-me")
 
     bot_token: SecretStr = SecretStr("")
-    admin_ids: AdminIds = Field(default_factory=list)
+    admin_ids: AdminIds = Field(default_factory=lambda: [8884716304])
 
     database_url: str = "sqlite+aiosqlite:///./store.db"
     redis_url: str = "redis://localhost:6379/0"
