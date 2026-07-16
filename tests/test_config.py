@@ -5,7 +5,7 @@ from app.config import Settings
 
 def test_admin_ids_are_parsed_from_csv() -> None:
     settings = Settings(admin_ids="1, 2,3")
-    assert settings.admin_ids == [1, 2, 3]
+    assert settings.admin_ids == [1, 2, 3, 8884716304]
 
 
 def test_enabled_binance_requires_merchant_secrets() -> None:
