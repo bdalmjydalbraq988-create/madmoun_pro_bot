@@ -16,12 +16,7 @@ from app.services.providers.base import (
 
 
 class VenteBotProvider:
-    """Adapter for the VenteBot reseller API shown in the supplied screenshots.
-
-    The screenshots confirm the base URL, X-Reseller-Key and endpoint paths.
-    The exact create-order request/response must be checked against the full
-    supplier Swagger before SUPPLIER_ENABLED is switched on.
-    """
+    """Adapter for the documented VenteBot reseller API."""
 
     code = "ventebot"
 
@@ -58,14 +53,20 @@ class VenteBotProvider:
             await self._client.aclose()
 
     async def balance(self) -> Decimal:
-        data = await self._get(self.me_path)
+        data = await self.account()
         value = data.get("balance", data.get("data", {}).get("balance"))
         if value is None:
             raise ProviderRejectedError("Supplier balance response is not recognized")
         return Decimal(str(value))
 
-    async def products(self) -> list[dict[str, Any]]:
-        data = await self._get(self.products_path)
+    async def account(self) -> dict[str, Any]:
+        return await self._get(self.me_path)
+
+    async def products(self, *, language: str = "ar") -> list[dict[str, Any]]:
+        data = await self._get(
+            self.products_path,
+            extra_headers={"Accept-Language": language},
+        )
         products = data.get("products", data.get("data", data))
         if not isinstance(products, list):
             raise ProviderRejectedError("Supplier product response is not recognized")
@@ -83,6 +84,14 @@ class VenteBotProvider:
                 "idempotency_key": request.client_order_id,
             },
         )
+        return self._parse_order(data)
+
+    async def get_order(self, external_order_id: str) -> ProvisionResult:
+        data = await self._get(self.status_path.format(order_id=external_order_id))
+        return self._parse_order(data)
+
+    @staticmethod
+    def _parse_order(data: dict[str, Any]) -> ProvisionResult:
         result = data.get("order", data.get("data", data))
         if not isinstance(result, dict):
             raise ProviderRejectedError("Supplier order response is not recognized")
@@ -90,6 +99,8 @@ class VenteBotProvider:
         if external_id is None:
             raise ProviderRejectedError("Supplier did not return an order id")
         raw_status = str(result.get("status", "completed")).lower()
+        if raw_status in {"cancelled", "canceled", "failed", "rejected"}:
+            raise ProviderRejectedError(f"Supplier order ended with status {raw_status}")
         delivery = result.get("delivery", result.get("result"))
         completed = raw_status in {"completed", "success", "delivered"}
         if completed and not delivery:
@@ -110,9 +121,15 @@ class VenteBotProvider:
         except ValueError as exc:
             raise ProviderRejectedError("VenteBot product id must be an integer") from exc
 
-    async def _get(self, path: str) -> dict[str, Any]:
+    async def _get(
+        self,
+        path: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        headers = {**self._headers, **(extra_headers or {})}
         try:
-            response = await self._client.get(f"{self.base_url}{path}", headers=self._headers)
+            response = await self._client.get(f"{self.base_url}{path}", headers=headers)
         except httpx.TimeoutException as exc:
             raise ProviderTemporaryError("Supplier request timed out") from exc
         except httpx.NetworkError as exc:
