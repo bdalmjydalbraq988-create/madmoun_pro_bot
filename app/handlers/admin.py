@@ -22,12 +22,30 @@ from app.keyboards import (
     admin_order_keyboard,
     admin_payment_keyboard,
     admin_product_keyboard,
+    admin_supplier_keyboard,
     cancel_keyboard,
 )
-from app.models import Category, Order, Payment, PaymentChannel, Product, User, Wallet
+from app.models import (
+    Category,
+    Order,
+    Payment,
+    PaymentChannel,
+    Product,
+    SupplierCatalogItem,
+    User,
+    Wallet,
+)
 from app.services.audit import add_audit
 from app.services.orders import OrderError, OrderService
 from app.services.payments.service import PaymentError, PaymentService
+from app.services.providers.quantumvault import VenteBotProvider
+from app.services.supplier_catalog import (
+    calculate_sale_price,
+    catalog_item_for_product,
+    get_sync_config,
+    reprice_unlocked_products,
+    sync_supplier_catalog,
+)
 from app.services.wallet import InsufficientBalance, WalletService, money
 from app.states import (
     AdminCategoryFlow,
@@ -40,6 +58,8 @@ from app.states import (
     AdminProductEditFlow,
     AdminProductFlow,
     AdminRefundFlow,
+    AdminSupplierMarkupFlow,
+    AdminSupplierMinimumProfitFlow,
     AdminWalletFlow,
 )
 
@@ -108,6 +128,221 @@ def build_admin_router(
                 await dashboard_text(session), reply_markup=admin_dashboard_keyboard()
             )
 
+    def supplier_client() -> VenteBotProvider | None:
+        api_key = settings.supplier_api_key.get_secret_value()
+        if not settings.supplier_enabled or not api_key:
+            return None
+        return VenteBotProvider(
+            base_url=settings.supplier_base_url,
+            api_key=api_key,
+            me_path=settings.supplier_me_path,
+            products_path=settings.supplier_products_path,
+            quote_path=settings.supplier_quote_path,
+            create_order_path=settings.supplier_create_order_path,
+            status_path=settings.supplier_order_status_path,
+            activation_identifier_path=settings.supplier_activation_identifier_path,
+        )
+
+    async def supplier_panel_text(session: AsyncSession) -> str:
+        config = await get_sync_config(session)
+        linked = (
+            await session.scalar(
+                select(func.count())
+                .select_from(SupplierCatalogItem)
+                .where(SupplierCatalogItem.provider_code == "ventebot")
+            )
+            or 0
+        )
+        active = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Product)
+                .where(
+                    Product.provider_code == "ventebot",
+                    Product.is_active.is_(True),
+                )
+            )
+            or 0
+        )
+        locked = (
+            await session.scalar(
+                select(func.count())
+                .select_from(SupplierCatalogItem)
+                .where(
+                    SupplierCatalogItem.provider_code == "ventebot",
+                    SupplierCatalogItem.price_locked.is_(True),
+                )
+            )
+            or 0
+        )
+        last_sync = (
+            config.last_synced_at.strftime("%Y-%m-%d %H:%M UTC")
+            if config.last_synced_at
+            else "لم تتم بعد"
+        )
+        enabled = settings.supplier_enabled and bool(settings.supplier_api_key.get_secret_value())
+        return (
+            "🔌 <b>المورد والمزامنة</b>\n\n"
+            f"حالة الربط: {'✅ جاهز' if enabled else '⚠️ غير مهيأ'}\n"
+            f"الخدمات المربوطة: {linked}\n"
+            f"الخدمات المفعلة: {active}\n"
+            f"أسعار يدوية محمية: {locked}\n"
+            f"نسبة الربح: {config.markup_percent:g}%\n"
+            f"أقل ربح للخدمة: {config.minimum_profit:g} USDT\n"
+            f"التفعيل بعد الجلب: {'تلقائي' if config.auto_activate else 'معطل للمراجعة'}\n"
+            f"آخر مزامنة: {last_sync}\n"
+            f"نتيجة آخر مزامنة: {html.escape(config.last_sync_status)}\n"
+            f"التفاصيل: {html.escape(config.last_sync_message or '-')}"
+        )
+
+    @router.callback_query(F.data == "adm:supplier")
+    async def supplier_panel(callback: CallbackQuery, session: AsyncSession) -> None:
+        config = await get_sync_config(session)
+        await callback.answer()
+        if callback.message:
+            await callback.message.edit_text(
+                await supplier_panel_text(session),
+                reply_markup=admin_supplier_keyboard(auto_activate=config.auto_activate),
+            )
+
+    @router.callback_query(F.data == "adm:supplier:sync")
+    async def supplier_sync(callback: CallbackQuery, session: AsyncSession) -> None:
+        provider = supplier_client()
+        if provider is None:
+            await callback.answer(
+                "أضف SUPPLIER_API_KEY واجعل SUPPLIER_ENABLED=true ثم أعد التشغيل.",
+                show_alert=True,
+            )
+            return
+        await callback.answer("جاري الاتصال بالمورد وجلب الخدمات…")
+        if callback.message:
+            await callback.message.edit_text("⏳ جاري التحقق من المورد وتحديث الكتالوج…")
+        try:
+            balance = await provider.balance()
+            result = await sync_supplier_catalog(
+                session,
+                provider=provider,
+                actor_user_id=callback.from_user.id,
+            )
+        except Exception as exc:
+            config = await get_sync_config(session)
+            config.last_sync_status = "failed"
+            config.last_sync_message = str(exc)[:500]
+            if callback.message:
+                await callback.message.edit_text(
+                    "❌ فشلت المزامنة دون تغيير أرصدة العملاء أو إنشاء طلبات.\n\n"
+                    f"السبب: <code>{html.escape(str(exc)[:350])}</code>",
+                    reply_markup=admin_supplier_keyboard(auto_activate=config.auto_activate),
+                )
+            return
+        finally:
+            await provider.close()
+        config = await get_sync_config(session)
+        if callback.message:
+            await callback.message.edit_text(
+                "✅ <b>اكتملت مزامنة المورد</b>\n\n"
+                f"رصيد المورد: {balance:g} USDT\n"
+                f"وصل من المورد: {result.received}\n"
+                f"خدمات جديدة: {result.created}\n"
+                f"خدمات محدثة: {result.updated}\n"
+                f"خدمات عُطلت لعدم توفرها: {result.deactivated}\n"
+                f"عناصر متجاوزة لخلل بياناتها: {result.skipped}",
+                reply_markup=admin_supplier_keyboard(auto_activate=config.auto_activate),
+            )
+
+    @router.callback_query(F.data == "adm:supplier:markup")
+    async def begin_supplier_markup(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(AdminSupplierMarkupFlow.value)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "أرسل نسبة الربح فوق تكلفة المورد. مثال: 30",
+                reply_markup=cancel_keyboard(),
+            )
+
+    @router.message(AdminSupplierMarkupFlow.value, F.text)
+    async def save_supplier_markup(
+        message: Message, session: AsyncSession, state: FSMContext
+    ) -> None:
+        try:
+            value = Decimal(message.text.replace(",", ".").strip()).quantize(Decimal("0.0001"))
+        except InvalidOperation:
+            await message.answer("أرسل نسبة رقمية صحيحة.")
+            return
+        if value < 0 or value > 500:
+            await message.answer("النسبة يجب أن تكون بين 0 و500.")
+            return
+        config = await get_sync_config(session)
+        config.markup_percent = value
+        changed = await reprice_unlocked_products(session)
+        add_audit(
+            session,
+            actor_user_id=message.from_user.id,
+            action="supplier.markup_changed",
+            entity_type="supplier",
+            entity_id="ventebot",
+            metadata={"markup_percent": format(value, "f"), "repriced": changed},
+        )
+        await state.clear()
+        await message.answer(
+            f"✅ نسبة الربح الآن {value:g}%، وأُعيد تسعير {changed} خدمة غير مقفلة."
+        )
+
+    @router.callback_query(F.data == "adm:supplier:minprofit")
+    async def begin_supplier_minimum_profit(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(AdminSupplierMinimumProfitFlow.value)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "أرسل أقل ربح لكل خدمة بـ USDT. مثال: 0.50",
+                reply_markup=cancel_keyboard(),
+            )
+
+    @router.message(AdminSupplierMinimumProfitFlow.value, F.text)
+    async def save_supplier_minimum_profit(
+        message: Message, session: AsyncSession, state: FSMContext
+    ) -> None:
+        try:
+            value = money(Decimal(message.text.replace(",", ".").strip()))
+        except InvalidOperation:
+            await message.answer("أرسل مبلغًا رقميًا صحيحًا.")
+            return
+        if value < 0 or value > Decimal("1000"):
+            await message.answer("أقل ربح يجب أن يكون بين 0 و1000 USDT.")
+            return
+        config = await get_sync_config(session)
+        config.minimum_profit = value
+        changed = await reprice_unlocked_products(session)
+        add_audit(
+            session,
+            actor_user_id=message.from_user.id,
+            action="supplier.minimum_profit_changed",
+            entity_type="supplier",
+            entity_id="ventebot",
+            metadata={"minimum_profit": format(value, "f"), "repriced": changed},
+        )
+        await state.clear()
+        await message.answer(f"✅ أقل ربح الآن {value:g} USDT، وأُعيد تسعير {changed} خدمة.")
+
+    @router.callback_query(F.data == "adm:supplier:autoactivate")
+    async def toggle_supplier_auto_activate(callback: CallbackQuery, session: AsyncSession) -> None:
+        config = await get_sync_config(session)
+        config.auto_activate = not config.auto_activate
+        add_audit(
+            session,
+            actor_user_id=callback.from_user.id,
+            action="supplier.auto_activate_toggled",
+            entity_type="supplier",
+            entity_id="ventebot",
+            metadata={"auto_activate": config.auto_activate},
+        )
+        await callback.answer("تم تحديث سياسة التفعيل")
+        if callback.message:
+            await callback.message.edit_text(
+                await supplier_panel_text(session),
+                reply_markup=admin_supplier_keyboard(auto_activate=config.auto_activate),
+            )
+
     @router.callback_query(F.data == "adm:products")
     async def products_list(callback: CallbackQuery, session: AsyncSession) -> None:
         products = list(await session.scalars(select(Product).order_by(Product.name_ar)))
@@ -134,6 +369,17 @@ def build_admin_router(
         if product is None:
             await callback.answer("الخدمة غير موجودة", show_alert=True)
             return
+        snapshot = await catalog_item_for_product(session, product.id)
+        supplier_details = ""
+        if snapshot is not None:
+            stock = "غير محدد" if snapshot.stock is None else str(snapshot.stock)
+            supplier_details = (
+                f"\nالمخزون: {stock}"
+                f"\nنوع التسليم: {html.escape(snapshot.delivery_type)}"
+                f"\nضمان المورد: {snapshot.warranty_days} يوم"
+                f"\nالتسعير: {'يدوي محمي' if snapshot.price_locked else 'تلقائي'}"
+                f"\nالتفعيل: {'يدوي محمي' if snapshot.activation_locked else 'تلقائي'}"
+            )
         text = (
             f"<b>{html.escape(product.name_ar)}</b>\n"
             f"السعر: {product.sale_price:g} {product.currency}\n"
@@ -141,6 +387,7 @@ def build_admin_router(
             f"الحالة: {'مفعلة' if product.is_active else 'معطلة'}\n"
             f"التنفيذ: {product.fulfillment_mode.value}\n"
             f"معرّف المورد: <code>{html.escape(product.provider_product_id or '-')}</code>"
+            f"{supplier_details}"
         )
         await callback.answer()
         if callback.message:
@@ -170,6 +417,9 @@ def build_admin_router(
             await callback.answer("فعّل واختبر API المورد أولًا", show_alert=True)
             return
         product.is_active = not product.is_active
+        snapshot = await catalog_item_for_product(session, product.id)
+        if snapshot is not None:
+            snapshot.activation_locked = True
         add_audit(
             session,
             actor_user_id=callback.from_user.id,
@@ -211,6 +461,9 @@ def build_admin_router(
             return
         old = product.sale_price
         product.sale_price = price
+        snapshot = await catalog_item_for_product(session, product.id)
+        if snapshot is not None:
+            snapshot.price_locked = True
         add_audit(
             session,
             actor_user_id=message.from_user.id,
@@ -221,6 +474,60 @@ def build_admin_router(
         )
         await state.clear()
         await message.answer(f"✅ أصبح سعر {html.escape(product.name_ar)}: {price:g} USDT")
+
+    @router.callback_query(F.data.startswith("adm:autoprice:"))
+    async def restore_automatic_price(callback: CallbackQuery, session: AsyncSession) -> None:
+        product = await session.get(Product, uuid.UUID(callback.data.rsplit(":", 1)[1]))
+        if product is None or product.cost_price is None:
+            await callback.answer("الخدمة أو تكلفة المورد غير متاحة", show_alert=True)
+            return
+        snapshot = await catalog_item_for_product(session, product.id)
+        if snapshot is None:
+            await callback.answer("هذه ليست خدمة مورّد متزامنة", show_alert=True)
+            return
+        config = await get_sync_config(session)
+        snapshot.price_locked = False
+        product.sale_price = calculate_sale_price(
+            product.cost_price,
+            markup_percent=config.markup_percent,
+            minimum_profit=config.minimum_profit,
+        )
+        add_audit(
+            session,
+            actor_user_id=callback.from_user.id,
+            action="product.automatic_price_restored",
+            entity_type="product",
+            entity_id=str(product.id),
+            metadata={"sale_price": format(product.sale_price, "f")},
+        )
+        await callback.answer(f"السعر التلقائي: {product.sale_price:g} USDT", show_alert=True)
+
+    @router.callback_query(F.data.startswith("adm:autoactive:"))
+    async def restore_automatic_activation(callback: CallbackQuery, session: AsyncSession) -> None:
+        product = await session.get(Product, uuid.UUID(callback.data.rsplit(":", 1)[1]))
+        if product is None:
+            await callback.answer("الخدمة غير موجودة", show_alert=True)
+            return
+        snapshot = await catalog_item_for_product(session, product.id)
+        if snapshot is None:
+            await callback.answer("هذه ليست خدمة مورّد متزامنة", show_alert=True)
+            return
+        config = await get_sync_config(session)
+        snapshot.activation_locked = False
+        available = snapshot.stock is None or snapshot.stock > 0
+        product.is_active = config.auto_activate and available
+        add_audit(
+            session,
+            actor_user_id=callback.from_user.id,
+            action="product.automatic_activation_restored",
+            entity_type="product",
+            entity_id=str(product.id),
+            metadata={"active": product.is_active},
+        )
+        await callback.answer(
+            f"أصبح التوفر تلقائيًا؛ الحالة الآن: {'مفعلة' if product.is_active else 'معطلة'}",
+            show_alert=True,
+        )
 
     @router.callback_query(F.data.startswith("adm:edit:"))
     async def choose_product_edit_field(callback: CallbackQuery) -> None:
