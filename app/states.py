@@ -62,3 +62,11 @@ class AdminChannelFeeFlow(StatesGroup):
 
 class AdminChannelInstructionsFlow(StatesGroup):
     value = State()
+
+
+class AdminSupplierMarkupFlow(StatesGroup):
+    value = State()
+
+
+class AdminSupplierMinimumProfitFlow(StatesGroup):
+    value = State()
