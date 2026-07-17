@@ -8,6 +8,12 @@ def test_admin_ids_are_parsed_from_csv() -> None:
     assert settings.admin_ids == [1, 2, 3, 8884716304]
 
 
+def test_admin_ids_are_parsed_from_environment_json_list(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_IDS", "[123]")
+    settings = Settings()
+    assert settings.admin_ids == [123, 8884716304]
+
+
 def test_enabled_binance_requires_merchant_secrets() -> None:
     try:
         Settings(binance_pay_enabled=True)
