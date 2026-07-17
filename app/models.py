@@ -142,6 +142,46 @@ class Product(TimestampMixin, Base):
     orders: Mapped[list[Order]] = relationship(back_populates="product")
 
 
+class SupplierCatalogItem(TimestampMixin, Base):
+    """Latest safe catalog snapshot received from a supplier."""
+
+    __tablename__ = "supplier_catalog_items"
+    __table_args__ = (
+        UniqueConstraint("product_id", name="uq_supplier_catalog_product"),
+        Index("ix_supplier_catalog_seen", "provider_code", "last_seen_at"),
+    )
+
+    provider_code: Mapped[str] = mapped_column(String(40), primary_key=True)
+    provider_product_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    product_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("products.id", ondelete="SET NULL"), index=True
+    )
+    image_url: Mapped[str | None] = mapped_column(Text)
+    delivery_type: Mapped[str] = mapped_column(String(20), default="activation")
+    stock: Mapped[int | None] = mapped_column(Integer)
+    warranty_days: Mapped[int] = mapped_column(Integer, default=0)
+    price_tiers_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    raw_payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    price_locked: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    activation_locked: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SupplierSyncConfig(TimestampMixin, Base):
+    """Admin-controlled pricing and synchronization policy for one supplier."""
+
+    __tablename__ = "supplier_sync_configs"
+
+    provider_code: Mapped[str] = mapped_column(String(40), primary_key=True)
+    markup_percent: Mapped[Decimal] = mapped_column(Numeric(9, 4), default=Decimal("25"))
+    minimum_profit: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.25"))
+    auto_activate: Mapped[bool] = mapped_column(Boolean, default=True)
+    deactivate_missing: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_sync_status: Mapped[str] = mapped_column(String(20), default="never")
+    last_sync_message: Mapped[str] = mapped_column(String(500), default="")
+
+
 class Order(TimestampMixin, Base):
     __tablename__ = "orders"
     __table_args__ = (
