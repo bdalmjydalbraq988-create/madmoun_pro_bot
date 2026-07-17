@@ -31,8 +31,9 @@ def categories_keyboard(categories: Iterable[Category]) -> InlineKeyboardMarkup:
 def products_keyboard(products: Iterable[Product]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for product in products:
+        display_name = product.name_ar if len(product.name_ar) <= 42 else f"{product.name_ar[:41]}…"
         builder.button(
-            text=f"{product.name_ar} — {product.sale_price:g} USDT",
+            text=f"{display_name} — {product.sale_price:g}$",
             callback_data=f"prd:{product.id}",
         )
     builder.button(text="↩️ الأقسام", callback_data="catalog")
@@ -89,22 +90,52 @@ def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="➕ إضافة خدمة", callback_data="adm:add_product")],
             [InlineKeyboardButton(text="➕ إضافة قسم", callback_data="adm:add_category")],
+            [InlineKeyboardButton(text="🔄 المورد والمزامنة", callback_data="adm:supplier")],
         ]
     )
 
 
 def admin_product_keyboard(product: Product) -> InlineKeyboardMarkup:
     active_text = "🔴 تعطيل" if product.is_active else "🟢 تفعيل"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💵 تعديل السعر", callback_data=f"adm:price:{product.id}")],
+    rows = [
+        [InlineKeyboardButton(text="💵 تعديل السعر", callback_data=f"adm:price:{product.id}")],
+        [
+            InlineKeyboardButton(
+                text="✏️ تعديل بيانات الخدمة", callback_data=f"adm:edit:{product.id}"
+            )
+        ],
+        [InlineKeyboardButton(text=active_text, callback_data=f"adm:toggle:{product.id}")],
+    ]
+    if product.provider_code == "ventebot" and product.provider_product_id:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="✏️ تعديل بيانات الخدمة", callback_data=f"adm:edit:{product.id}"
+                    text="♻️ سعر تلقائي", callback_data=f"adm:autoprice:{product.id}"
+                ),
+                InlineKeyboardButton(
+                    text="♻️ توفر تلقائي", callback_data=f"adm:autoactive:{product.id}"
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="↩️ الخدمات", callback_data="adm:products")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_supplier_keyboard(*, auto_activate: bool) -> InlineKeyboardMarkup:
+    activation_text = "🔴 إيقاف التفعيل التلقائي" if auto_activate else "🟢 تفعيل تلقائي"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 جلب وتحديث الخدمات الآن", callback_data="adm:supplier:sync"
                 )
             ],
-            [InlineKeyboardButton(text=active_text, callback_data=f"adm:toggle:{product.id}")],
-            [InlineKeyboardButton(text="↩️ الخدمات", callback_data="adm:products")],
+            [
+                InlineKeyboardButton(text="📈 نسبة الربح", callback_data="adm:supplier:markup"),
+                InlineKeyboardButton(text="💵 أقل ربح", callback_data="adm:supplier:minprofit"),
+            ],
+            [InlineKeyboardButton(text=activation_text, callback_data="adm:supplier:autoactivate")],
+            [InlineKeyboardButton(text="↩️ لوحة الإدارة", callback_data="adm:dashboard")],
         ]
     )
 
