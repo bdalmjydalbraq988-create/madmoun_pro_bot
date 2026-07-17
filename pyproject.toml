@@ -1,6 +1,6 @@
 [project]
 name = "digital-store-bot"
-version = "0.2.0"
+version = "0.3.0"
 description = "Secure Arabic Telegram storefront for digital services"
 readme = "README.md"
 requires-python = ">=3.12"
