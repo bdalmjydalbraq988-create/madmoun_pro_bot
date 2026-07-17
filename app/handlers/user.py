@@ -6,6 +6,7 @@ import uuid
 from decimal import Decimal, InvalidOperation
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -34,6 +35,7 @@ from app.services.catalog import (
 from app.services.orders import OrderError, OrderService
 from app.services.payments.binance import BinancePayClient, BinancePayError
 from app.services.payments.service import PaymentError, PaymentQuote, PaymentService
+from app.services.supplier_catalog import catalog_item_for_product
 from app.services.users import upsert_telegram_user
 from app.services.wallet import InsufficientBalance
 from app.states import BuyFlow, DepositFlow
@@ -119,10 +121,15 @@ def build_user_router(
         products = await active_products(session, category_id)
         await callback.answer()
         if callback.message:
-            await callback.message.edit_text(
-                "اختر الخدمة:" if products else "لا توجد خدمات مفعّلة في هذا القسم.",
-                reply_markup=products_keyboard(products),
-            )
+            text = "اختر الخدمة:" if products else "لا توجد خدمات مفعّلة في هذا القسم."
+            if callback.message.photo:
+                await callback.message.answer(text, reply_markup=products_keyboard(products))
+                await callback.message.delete()
+            else:
+                await callback.message.edit_text(
+                    text,
+                    reply_markup=products_keyboard(products),
+                )
 
     @router.callback_query(F.data.startswith("prd:"))
     async def product_details(callback: CallbackQuery, session: AsyncSession) -> None:
@@ -135,17 +142,40 @@ def build_user_router(
         if product is None:
             await callback.answer("الخدمة غير متاحة", show_alert=True)
             return
+        snapshot = await catalog_item_for_product(session, product.id)
+        requirement = (
+            "التسليم: تلقائي فور اكتمال طلب المورد"
+            if snapshot is not None and snapshot.delivery_type == "stock"
+            else f"المطلوب: {html.escape(product.customer_input_label)}"
+        )
         text = (
             f"<b>{html.escape(product.name_ar)}</b>\n\n"
             f"{html.escape(product.description_ar)}\n\n"
             f"السعر: <b>{product.sale_price:g} {product.currency}</b>\n"
-            f"المطلوب: {html.escape(product.customer_input_label)}\n\n"
+            f"{requirement}\n\n"
             f"⚠️ {html.escape(product.customer_input_help)}"
         )
         if product.terms_ar:
             text += f"\n\nالشروط:\n{html.escape(product.terms_ar)}"
         await callback.answer()
         if callback.message:
+            if snapshot is not None and snapshot.image_url:
+                caption = (
+                    f"<b>{html.escape(product.name_ar)}</b>\n\n"
+                    f"{html.escape(product.description_ar[:500])}\n\n"
+                    f"💵 <b>{product.sale_price:g} {product.currency}</b>\n"
+                    f"{requirement}"
+                )
+                try:
+                    await callback.message.answer_photo(
+                        snapshot.image_url,
+                        caption=caption,
+                        reply_markup=product_keyboard(product),
+                    )
+                    await callback.message.delete()
+                    return
+                except TelegramBadRequest:
+                    pass
             await callback.message.edit_text(text, reply_markup=product_keyboard(product))
 
     @router.callback_query(F.data.startswith("buy:"))
@@ -166,7 +196,28 @@ def build_user_router(
                 show_alert=True,
             )
             return
+        snapshot = await catalog_item_for_product(session, product.id)
         token = secrets.token_hex(8)
+        if snapshot is not None and snapshot.delivery_type == "stock":
+            await state.set_state(BuyFlow.confirmation)
+            await state.set_data(
+                {
+                    "product_id": str(product.id),
+                    "purchase_token": token,
+                    "customer_input": "",
+                }
+            )
+            await callback.answer()
+            if callback.message:
+                await callback.message.answer(
+                    f"راجع الطلب:\n\n"
+                    f"الخدمة: <b>{html.escape(product.name_ar)}</b>\n"
+                    f"السعر: <b>{product.sale_price:g} {product.currency}</b>\n"
+                    "التسليم: تلقائي بعد تنفيذ المورد\n\n"
+                    "بعد التأكيد سيُخصم المبلغ من الرصيد.",
+                    reply_markup=confirm_buy_keyboard(token),
+                )
+            return
         await state.set_state(BuyFlow.customer_input)
         await state.set_data({"product_id": str(product.id), "purchase_token": token})
         await callback.answer()
