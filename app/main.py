@@ -18,6 +18,7 @@ from app.services.orders import OrderProcessor, OrderService
 from app.services.payments.binance import BinancePayClient
 from app.services.payments.service import PaymentService
 from app.services.providers.quantumvault import VenteBotProvider
+from app.services.supplier_catalog import sync_supplier_catalog
 from app.web.routes import router as web_router
 
 logging.basicConfig(
@@ -38,6 +39,36 @@ async def worker_loop(processor: OrderProcessor, interval: float) -> None:
             processed = False
         if not processed:
             await asyncio.sleep(interval)
+
+
+async def supplier_catalog_loop(
+    *,
+    session_factory,
+    provider: VenteBotProvider,
+    interval_minutes: int,
+) -> None:
+    """Refresh prices, stock and images without blocking order processing."""
+    interval = max(5, interval_minutes) * 60
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with session_factory() as session:
+                result = await sync_supplier_catalog(
+                    session,
+                    provider=provider,
+                    actor_user_id=None,
+                )
+                await session.commit()
+                logger.info(
+                    "Automatic supplier catalog sync completed: received=%s created=%s updated=%s",
+                    result.received,
+                    result.created,
+                    result.updated,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Automatic supplier catalog sync failed")
 
 
 @asynccontextmanager
@@ -135,6 +166,17 @@ async def lifespan(app: FastAPI):
         worker_loop(processor, settings.order_worker_interval_seconds),
         name="order-worker",
     )
+    supplier_sync_task = None
+    supplier_provider = providers.get("ventebot")
+    if isinstance(supplier_provider, VenteBotProvider):
+        supplier_sync_task = asyncio.create_task(
+            supplier_catalog_loop(
+                session_factory=session_factory,
+                provider=supplier_provider,
+                interval_minutes=settings.supplier_catalog_sync_minutes,
+            ),
+            name="supplier-catalog-sync",
+        )
     if bot and dispatcher and settings.is_production:
         webhook_secret = settings.webhook_secret_path.get_secret_value()
         await bot.set_webhook(
@@ -161,10 +203,15 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         worker_task.cancel()
+        if supplier_sync_task:
+            supplier_sync_task.cancel()
         if polling_task:
             polling_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+        if supplier_sync_task:
+            with contextlib.suppress(asyncio.CancelledError):
+                await supplier_sync_task
         if polling_task:
             with contextlib.suppress(asyncio.CancelledError):
                 await polling_task
@@ -181,7 +228,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Digital Store Bot",
-    version="0.1.0",
+    version="0.3.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
