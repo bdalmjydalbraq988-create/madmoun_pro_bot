@@ -10,6 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def _parse_admin_ids(value: object) -> list[int]:
     if isinstance(value, str):
         return [int(item.strip()) for item in value.split(",") if item.strip()]
+    if isinstance(value, int):
+        return [value]
     if isinstance(value, (list, tuple, set)):
         return [int(item) for item in value]
     return []
