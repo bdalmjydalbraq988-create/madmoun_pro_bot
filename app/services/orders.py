@@ -221,7 +221,7 @@ class OrderProcessor:
                 select(Order)
                 .options(selectinload(Order.product))
                 .where(
-                    Order.status == OrderStatus.QUEUED,
+                    Order.status.in_([OrderStatus.QUEUED, OrderStatus.PROVIDER_PENDING]),
                     (Order.next_retry_at.is_(None) | (Order.next_retry_at <= datetime.now(UTC))),
                 )
                 .order_by(Order.created_at)
@@ -230,10 +230,13 @@ class OrderProcessor:
             )
             if order is None:
                 return False
+            previous_status = order.status
             order.status = OrderStatus.PROCESSING
-            order.retry_count += 1
+            if previous_status is OrderStatus.QUEUED:
+                order.retry_count += 1
             order_id = order.id
             provider_code = order.provider_code
+            provider_order_id = order.provider_order_id
             product_id = order.product.provider_product_id
             customer_input = self.order_service.cipher.decrypt(order.customer_input_encrypted)
             request = ProvisionRequest(
@@ -250,11 +253,24 @@ class OrderProcessor:
             return True
 
         try:
-            result = await provider.create_order(request)
+            if previous_status is OrderStatus.PROVIDER_PENDING:
+                if not provider_order_id:
+                    await self._mark_review(
+                        order_id,
+                        "provider_order_id_missing",
+                        "معرّف طلب المورد غير موجود",
+                    )
+                    return True
+                result = await provider.get_order(provider_order_id)
+            else:
+                result = await provider.create_order(request)
         except ProviderUncertainError as exc:
             await self._mark_review(order_id, exc.code, str(exc))
         except ProviderTemporaryError as exc:
-            await self._retry_or_review(order_id, exc.code, str(exc))
+            if previous_status is OrderStatus.PROVIDER_PENDING:
+                await self._retry_pending(order_id, exc.code, str(exc))
+            else:
+                await self._retry_or_review(order_id, exc.code, str(exc))
         except ProviderRejectedError as exc:
             await self._refund_failure(order_id, exc.code, str(exc))
         except Exception:
@@ -276,6 +292,7 @@ class OrderProcessor:
                     message = "completed"
                 else:
                     order.status = OrderStatus.PROVIDER_PENDING
+                    order.next_retry_at = datetime.now(UTC) + timedelta(seconds=60)
                     message = "provider_pending"
                 await session.commit()
                 if self.notifier:
@@ -318,6 +335,19 @@ class OrderProcessor:
             else:
                 order.status = OrderStatus.QUEUED
                 order.next_retry_at = datetime.now(UTC) + timedelta(seconds=30 * order.retry_count)
+            await session.commit()
+
+    async def _retry_pending(self, order_id: uuid.UUID, code: str, message: str) -> None:
+        async with self.session_factory() as session:
+            order = await session.scalar(
+                select(Order).where(Order.id == order_id).with_for_update()
+            )
+            if order is None:
+                return
+            order.last_error_code = code
+            order.last_error_message = message[:500]
+            order.status = OrderStatus.PROVIDER_PENDING
+            order.next_retry_at = datetime.now(UTC) + timedelta(seconds=60)
             await session.commit()
 
     async def _refund_failure(self, order_id: uuid.UUID, code: str, message: str) -> None:
