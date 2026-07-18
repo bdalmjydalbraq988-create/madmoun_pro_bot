@@ -74,6 +74,53 @@ async def test_supplier_sync_creates_priced_product_with_image(session_factory) 
 
 
 @pytest.mark.asyncio
+async def test_supplier_sync_hides_setup_placeholder(session_factory) -> None:
+    supplier = FakeSupplier(
+        [
+            {
+                "id": 47,
+                "name": "Gemini 18 months",
+                "description": "حساب جاهز",
+                "image_url": "https://cdn.example/gemini-18.png",
+                "price_usd": 0.6,
+                "delivery_type": "stock",
+                "stock": 47,
+            }
+        ]
+    )
+    async with session_factory() as session:
+        category = Category(name_ar="تجريبي", emoji="🧪", is_active=True)
+        session.add(category)
+        await session.flush()
+        placeholder = Product(
+            category_id=category.id,
+            name_ar="Gemini Pro",
+            description_ar="اشتراك Gemini Pro. اضبط المدة والسعر وشروط المورد قبل التفعيل.",
+            sale_price=Decimal("3"),
+            provider_code="ventebot",
+            provider_product_id=None,
+            is_active=True,
+        )
+        session.add(placeholder)
+        await session.commit()
+
+        result = await sync_supplier_catalog(
+            session,
+            provider=supplier,  # type: ignore[arg-type]
+            actor_user_id=999,
+        )
+        await session.commit()
+
+        assert result.created == 1
+        assert not placeholder.is_active
+        imported = await session.scalar(select(Product).where(Product.provider_product_id == "47"))
+        snapshot = await session.get(SupplierCatalogItem, ("ventebot", "47"))
+        assert imported.is_active
+        assert snapshot.stock == 47
+        assert snapshot.delivery_type == "stock"
+
+
+@pytest.mark.asyncio
 async def test_sync_respects_manual_price_and_disables_zero_stock(session_factory) -> None:
     supplier = FakeSupplier(
         [
