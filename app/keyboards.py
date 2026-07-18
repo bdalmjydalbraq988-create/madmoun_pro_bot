@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from uuid import UUID
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-from app.models import Category, PaymentChannel, Product
+from app.models import Category, PaymentChannel, Product, SupplierCatalogItem
 
 
 def main_menu(is_admin: bool = False):
@@ -28,12 +29,45 @@ def categories_keyboard(categories: Iterable[Category]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def products_keyboard(products: Iterable[Product]) -> InlineKeyboardMarkup:
+def _service_icon(name: str) -> str:
+    search = name.casefold()
+    rules = (
+        ("✨", ("gemini", "جيمناي")),
+        ("🛸", ("grok",)),
+        ("🎬", ("netflix", "prime", "youtube", "شاهد")),
+        ("🎵", ("spotify", "سبوتيفاي")),
+        ("🎨", ("capcut", "canva", "adobe", "figma")),
+        ("🛡", ("vpn", "surfshark", "nord")),
+        ("🎓", ("coursera", "udemy", "linkedin")),
+        ("📧", ("gmail",)),
+    )
+    for icon, keywords in rules:
+        if any(keyword in search for keyword in keywords):
+            return icon
+    return "📦"
+
+
+def products_keyboard(
+    products: Iterable[Product],
+    snapshots: Mapping[UUID, SupplierCatalogItem] | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    snapshots = snapshots or {}
     for product in products:
-        display_name = product.name_ar if len(product.name_ar) <= 42 else f"{product.name_ar[:41]}…"
+        snapshot = snapshots.get(product.id)
+        stock = ""
+        if snapshot is not None and snapshot.stock is not None:
+            stock = f" | 📦 {snapshot.stock}"
+        suffix = f" | ${product.sale_price:g}{stock}"
+        icon = _service_icon(product.name_ar)
+        max_name = max(12, 62 - len(icon) - len(suffix))
+        display_name = (
+            product.name_ar
+            if len(product.name_ar) <= max_name
+            else f"{product.name_ar[: max_name - 1]}…"
+        )
         builder.button(
-            text=f"{display_name} — {product.sale_price:g}$",
+            text=f"{icon} {display_name}{suffix}",
             callback_data=f"prd:{product.id}",
         )
     builder.button(text="↩️ الأقسام", callback_data="catalog")
