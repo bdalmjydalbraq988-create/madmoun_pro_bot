@@ -20,21 +20,25 @@ from app.keyboards import (
     cancel_keyboard,
     categories_keyboard,
     confirm_buy_keyboard,
+    delivery_keyboard,
     main_menu,
     payment_channels_keyboard,
     product_keyboard,
     products_keyboard,
 )
-from app.models import Order, PaymentChannel, SupplierCatalogItem, Wallet
+from app.models import LedgerEntry, Order, PaymentChannel, SupplierCatalogItem, Wallet
 from app.services.catalog import (
     active_categories,
     active_products,
     get_active_product,
     validate_customer_input,
 )
+from app.services.delivery import delivery_html, is_placeholder_delivery
 from app.services.orders import OrderError, OrderService
 from app.services.payments.binance import BinancePayClient, BinancePayError
 from app.services.payments.service import PaymentError, PaymentQuote, PaymentService
+from app.services.providers.base import ProviderResultStatus
+from app.services.providers.quantumvault import VenteBotProvider
 from app.services.supplier_catalog import catalog_item_for_product
 from app.services.users import upsert_telegram_user
 from app.services.wallet import InsufficientBalance
@@ -70,6 +74,21 @@ def build_user_router(
             telegram_id=message.from_user.id,
             username=message.from_user.username,
             display_name=message.from_user.full_name,
+        )
+
+    def supplier_client() -> VenteBotProvider | None:
+        api_key = settings.supplier_api_key.get_secret_value()
+        if not settings.supplier_enabled or not api_key:
+            return None
+        return VenteBotProvider(
+            base_url=settings.supplier_base_url,
+            api_key=api_key,
+            me_path=settings.supplier_me_path,
+            products_path=settings.supplier_products_path,
+            quote_path=settings.supplier_quote_path,
+            create_order_path=settings.supplier_create_order_path,
+            status_path=settings.supplier_order_status_path,
+            activation_identifier_path=settings.supplier_activation_identifier_path,
         )
 
     @router.message(CommandStart())
@@ -305,10 +324,21 @@ def build_user_router(
             return
         await state.clear()
         await callback.answer("تم إنشاء الطلب")
+        purchase_entry = await session.scalar(
+            select(LedgerEntry).where(LedgerEntry.idempotency_key == f"order:purchase:{order.id}")
+        )
+        balance_text = ""
+        if purchase_entry is not None:
+            balance_text = (
+                f"\nالرصيد قبل: <b>{purchase_entry.balance_before:g} {order.currency}</b>"
+                f"\nتم الخصم: <b>{abs(purchase_entry.amount):g} {order.currency}</b>"
+                f"\nالرصيد المتبقي: <b>{purchase_entry.balance_after:g} {order.currency}</b>"
+            )
         if callback.message:
             await callback.message.edit_text(
                 f"✅ تم إنشاء الطلب <code>{order.public_code}</code>\n"
                 f"الحالة: {STATUS_AR[order.status]}\n"
+                f"{balance_text}\n"
                 "يمكن متابعته من «📦 طلباتي»."
             )
 
@@ -352,14 +382,49 @@ def build_user_router(
                 Order.status == OrderStatus.COMPLETED,
             )
         )
-        if order is None or not order.delivery_encrypted:
+        if order is None:
             await message.answer("بيانات التسليم غير متاحة.")
             return
-        delivery = cipher.decrypt(order.delivery_encrypted)
+        delivery = cipher.decrypt(order.delivery_encrypted) if order.delivery_encrypted else None
+        if (
+            order.provider_code == "ventebot"
+            and order.provider_order_id
+            and is_placeholder_delivery(delivery)
+        ):
+            provider = supplier_client()
+            if provider is not None:
+                try:
+                    result = await provider.get_order(order.provider_order_id)
+                    if result.status is ProviderResultStatus.COMPLETED and result.delivery:
+                        delivery = result.delivery
+                        order.delivery_encrypted = cipher.encrypt(delivery)
+                        order.provider_status = result.provider_status
+                except Exception:
+                    pass
+                finally:
+                    await provider.close()
+        if is_placeholder_delivery(delivery):
+            await message.answer(
+                "المورد أكد تنفيذ الطلب لكن بيانات التسليم لم تصل بعد. "
+                "أعد المحاولة بعد دقيقة أو تواصل مع الدعم برقم الطلب."
+            )
+            return
+        purchase_entry = await session.scalar(
+            select(LedgerEntry).where(LedgerEntry.idempotency_key == f"order:purchase:{order.id}")
+        )
+        balance_text = ""
+        if purchase_entry is not None:
+            balance_text = (
+                f"الرصيد قبل: <b>{purchase_entry.balance_before:g} {order.currency}</b>\n"
+                f"تم الخصم: <b>{abs(purchase_entry.amount):g} {order.currency}</b>\n"
+                f"الرصيد بعد الطلب: <b>{purchase_entry.balance_after:g} {order.currency}</b>\n\n"
+            )
         await message.answer(
             f"📨 تسليم الطلب <code>{order.public_code}</code>:\n\n"
-            f"<code>{html.escape(delivery)}</code>\n\n"
-            "احفظ البيانات في مكان آمن ولا تشاركها."
+            f"{balance_text}"
+            f"{delivery_html(delivery)}\n"
+            "اضغط على النص لنسخه أو استخدم الزر، واحفظه في مكان آمن.",
+            reply_markup=delivery_keyboard(delivery),
         )
 
     @router.message(F.text == "➕ شحن الرصيد")
