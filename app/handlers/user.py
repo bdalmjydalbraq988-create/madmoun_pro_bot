@@ -6,7 +6,7 @@ import uuid
 from decimal import Decimal, InvalidOperation
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -25,7 +25,7 @@ from app.keyboards import (
     product_keyboard,
     products_keyboard,
 )
-from app.models import Order, PaymentChannel, Wallet
+from app.models import Order, PaymentChannel, SupplierCatalogItem, Wallet
 from app.services.catalog import (
     active_categories,
     active_products,
@@ -119,16 +119,25 @@ def build_user_router(
             await callback.answer("طلب غير صالح", show_alert=True)
             return
         products = await active_products(session, category_id)
+        product_ids = [product.id for product in products]
+        snapshots = {}
+        if product_ids:
+            items = await session.scalars(
+                select(SupplierCatalogItem).where(SupplierCatalogItem.product_id.in_(product_ids))
+            )
+            snapshots = {item.product_id: item for item in items if item.product_id is not None}
         await callback.answer()
         if callback.message:
             text = "اختر الخدمة:" if products else "لا توجد خدمات مفعّلة في هذا القسم."
             if callback.message.photo:
-                await callback.message.answer(text, reply_markup=products_keyboard(products))
+                await callback.message.answer(
+                    text, reply_markup=products_keyboard(products, snapshots)
+                )
                 await callback.message.delete()
             else:
                 await callback.message.edit_text(
                     text,
-                    reply_markup=products_keyboard(products),
+                    reply_markup=products_keyboard(products, snapshots),
                 )
 
     @router.callback_query(F.data.startswith("prd:"))
@@ -148,33 +157,49 @@ def build_user_router(
             if snapshot is not None and snapshot.delivery_type == "stock"
             else f"المطلوب: {html.escape(product.customer_input_label)}"
         )
+        supplier_facts: list[str] = []
+        if snapshot is not None:
+            if snapshot.stock is not None:
+                supplier_facts.append(f"المخزون: <b>{snapshot.stock}</b>")
+            if snapshot.warranty_days:
+                supplier_facts.append(f"الضمان: <b>{snapshot.warranty_days} يومًا</b>")
+        facts = f"\n{' | '.join(supplier_facts)}" if supplier_facts else ""
         text = (
             f"<b>{html.escape(product.name_ar)}</b>\n\n"
             f"{html.escape(product.description_ar)}\n\n"
             f"السعر: <b>{product.sale_price:g} {product.currency}</b>\n"
-            f"{requirement}\n\n"
-            f"⚠️ {html.escape(product.customer_input_help)}"
+            f"{requirement}{facts}"
         )
+        if snapshot is None or snapshot.delivery_type != "stock":
+            text += f"\n\n⚠️ {html.escape(product.customer_input_help)}"
         if product.terms_ar:
             text += f"\n\nالشروط:\n{html.escape(product.terms_ar)}"
         await callback.answer()
         if callback.message:
             if snapshot is not None and snapshot.image_url:
-                caption = (
-                    f"<b>{html.escape(product.name_ar)}</b>\n\n"
-                    f"{html.escape(product.description_ar[:500])}\n\n"
-                    f"💵 <b>{product.sale_price:g} {product.currency}</b>\n"
-                    f"{requirement}"
-                )
                 try:
-                    await callback.message.answer_photo(
-                        snapshot.image_url,
-                        caption=caption,
-                        reply_markup=product_keyboard(product),
-                    )
+                    if len(text) <= 1000:
+                        await callback.message.answer_photo(
+                            snapshot.image_url,
+                            caption=text,
+                            reply_markup=product_keyboard(product),
+                        )
+                    else:
+                        await callback.message.answer_photo(
+                            snapshot.image_url,
+                            caption=(
+                                f"<b>{html.escape(product.name_ar)}</b>\n"
+                                f"💵 <b>{product.sale_price:g} {product.currency}</b>"
+                                f"{facts}"
+                            ),
+                        )
+                        await callback.message.answer(
+                            text,
+                            reply_markup=product_keyboard(product),
+                        )
                     await callback.message.delete()
                     return
-                except TelegramBadRequest:
+                except (TelegramBadRequest, TelegramAPIError):
                     pass
             await callback.message.edit_text(text, reply_markup=product_keyboard(product))
 
