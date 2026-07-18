@@ -3,10 +3,16 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from uuid import UUID
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from app.models import Category, PaymentChannel, Product, SupplierCatalogItem
+from app.services.delivery import first_http_url
 
 
 def main_menu(is_admin: bool = False):
@@ -91,6 +97,23 @@ def confirm_buy_keyboard(token: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")],
         ]
     )
+
+
+def delivery_keyboard(delivery: str) -> InlineKeyboardMarkup | None:
+    rows: list[list[InlineKeyboardButton]] = []
+    url = first_http_url(delivery)
+    if url and len(url) <= 256:
+        rows.append([InlineKeyboardButton(text="🔗 فتح الرابط", url=url)])
+    if len(delivery) <= 256:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📋 نسخ بيانات التسليم",
+                    copy_text=CopyTextButton(text=delivery),
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 def payment_channels_keyboard(channels: Iterable[PaymentChannel]) -> InlineKeyboardMarkup:
