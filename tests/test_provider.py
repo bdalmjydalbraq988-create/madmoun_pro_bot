@@ -85,8 +85,20 @@ async def test_ventebot_uses_documented_order_fields_and_parses_wrapper() -> Non
             200,
             json={
                 "success": True,
-                "replayed": False,
-                "order": {"id": 124, "status": "COMPLETED"},
+                "idempotent": False,
+                "balance_after": 37.5,
+                "unit_price": 5.0,
+                "total": 5.0,
+                "order": {
+                    "id": 124,
+                    "status": "COMPLETED",
+                    "items": [
+                        {
+                            "id": 99,
+                            "account_data": "https://serviceactivation.google/example",
+                        }
+                    ],
+                },
             },
         )
 
@@ -108,11 +120,13 @@ async def test_ventebot_uses_documented_order_fields_and_parses_wrapper() -> Non
         "product_id": 12,
         "quantity": 1,
         "activation_identifier": "user@example.com",
+        "customer_reference": "order-555",
         "idempotency_key": "order-555",
     }
     assert result.external_order_id == "124"
     assert result.status.value == "completed"
-    assert result.delivery
+    assert result.delivery == "https://serviceactivation.google/example"
+    assert result.safe_metadata["balance_after"] == 37.5
     await http_client.aclose()
 
 
@@ -123,7 +137,14 @@ async def test_ventebot_reads_pending_order_status_without_creating_again() -> N
         assert request.url.path == "/api/reseller/orders/124"
         return httpx.Response(
             200,
-            json={"success": True, "order": {"id": 124, "status": "COMPLETED"}},
+            json={
+                "success": True,
+                "order": {
+                    "id": 124,
+                    "status": "COMPLETED",
+                    "items": [{"id": 99, "account_data": "login: password"}],
+                },
+            },
         )
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -135,5 +156,31 @@ async def test_ventebot_reads_pending_order_status_without_creating_again() -> N
     result = await provider.get_order("124")
     assert result.external_order_id == "124"
     assert result.status.value == "completed"
-    assert result.delivery
+    assert result.delivery == "login: password"
     await http_client.aclose()
+
+
+def test_completed_supplier_order_without_items_is_not_falsely_delivered() -> None:
+    result = VenteBotProvider._parse_order(
+        {"success": True, "order": {"id": 124, "status": "COMPLETED", "items": []}}
+    )
+    assert result.status.value == "pending"
+    assert result.delivery is None
+    assert result.safe_metadata["delivery_missing"] is True
+
+
+def test_supplier_delivery_combines_all_account_items() -> None:
+    result = VenteBotProvider._parse_order(
+        {
+            "success": True,
+            "order": {
+                "id": 124,
+                "status": "COMPLETED",
+                "items": [
+                    {"id": 1, "account_data": "first-account"},
+                    {"id": 2, "account_data": "second-account"},
+                ],
+            },
+        }
+    )
+    assert result.delivery == "first-account\n\nsecond-account"
