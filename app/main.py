@@ -50,7 +50,6 @@ async def supplier_catalog_loop(
     """Refresh prices, stock and images without blocking order processing."""
     interval = max(5, interval_minutes) * 60
     while True:
-        await asyncio.sleep(interval)
         try:
             async with session_factory() as session:
                 result = await sync_supplier_catalog(
@@ -69,6 +68,7 @@ async def supplier_catalog_loop(
             raise
         except Exception:
             logger.exception("Automatic supplier catalog sync failed")
+        await asyncio.sleep(interval)
 
 
 @asynccontextmanager
