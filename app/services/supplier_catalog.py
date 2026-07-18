@@ -313,6 +313,18 @@ async def sync_supplier_catalog(
         snapshot.raw_payload_json = item.raw_payload
         snapshot.last_seen_at = now
 
+    if seen_ids:
+        placeholder = await session.scalar(
+            select(Product).where(
+                Product.name_ar == "Gemini Pro",
+                Product.provider_product_id.is_(None),
+                Product.description_ar
+                == "اشتراك Gemini Pro. اضبط المدة والسعر وشروط المورد قبل التفعيل.",
+            )
+        )
+        if placeholder is not None:
+            placeholder.is_active = False
+
     deactivated = 0
     if config.deactivate_missing:
         for snapshot in snapshots:
