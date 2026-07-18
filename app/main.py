@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 from contextlib import asynccontextmanager
 
 from aiogram.types import Update
 from fastapi import FastAPI, Header, HTTPException
+from sqlalchemy import select
 
 from app.bootstrap import seed_defaults
 from app.bot import build_bot, build_dispatcher
 from app.config import get_settings
 from app.crypto import PayloadCipher
 from app.db import create_engine, create_session_factory
-from app.models import Base, Order
+from app.keyboards import delivery_keyboard
+from app.models import Base, LedgerEntry, Order
+from app.services.delivery import delivery_html, is_placeholder_delivery
 from app.services.orders import OrderProcessor, OrderService
 from app.services.payments.binance import BinancePayClient
 from app.services.payments.service import PaymentService
@@ -132,10 +136,42 @@ async def lifespan(app: FastAPI):
         if not bot:
             return
         if event == "completed":
-            text = (
-                f"✅ اكتمل طلبك <code>{order.public_code}</code>.\n"
-                f"اعرض التسليم بالأمر /delivery_{order.public_code}"
+            async with session_factory() as session:
+                purchase_entry = await session.scalar(
+                    select(LedgerEntry).where(
+                        LedgerEntry.idempotency_key == f"order:purchase:{order.id}"
+                    )
+                )
+            paid = abs(purchase_entry.amount) if purchase_entry is not None else order.total_amount
+            remaining = (
+                f"{purchase_entry.balance_after:g} {order.currency}"
+                if purchase_entry is not None
+                else "راجع محفظتك"
             )
+            before_line = (
+                f"الرصيد قبل: <b>{purchase_entry.balance_before:g} {order.currency}</b>\n"
+                if purchase_entry is not None
+                else ""
+            )
+            text = (
+                f"✅ <b>اكتمل طلبك</b> <code>{order.public_code}</code>\n"
+                f"الخدمة: {html.escape(order.product_name_snapshot)}\n\n"
+                f"{before_line}"
+                f"تم الخصم: <b>{paid:g} {order.currency}</b>\n"
+                f"الرصيد المتبقي: <b>{remaining}</b>"
+            )
+            await bot.send_message(order.user_id, text)
+            delivery = (
+                cipher.decrypt(order.delivery_encrypted) if order.delivery_encrypted else None
+            )
+            if not is_placeholder_delivery(delivery):
+                await bot.send_message(
+                    order.user_id,
+                    f"📨 <b>بيانات التسليم</b>\n\n{delivery_html(delivery)}\n"
+                    "اضغط على النص لنسخه أو افتح الرابط من الزر.",
+                    reply_markup=delivery_keyboard(delivery),
+                )
+            return
         elif event == "refunded":
             text = f"↩️ تعذر تنفيذ الطلب <code>{order.public_code}</code> وأُعيد المبلغ إلى رصيدك."
         elif event == "review_required":
