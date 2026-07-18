@@ -20,7 +20,7 @@ async def seed_defaults(session: AsyncSession, settings: Settings) -> None:
         await session.flush()
 
     product = await session.scalar(select(Product).where(Product.name_ar == "Gemini Pro"))
-    if product is None:
+    if product is None and not settings.supplier_enabled:
         session.add(
             Product(
                 category_id=category.id,
@@ -36,6 +36,15 @@ async def seed_defaults(session: AsyncSession, settings: Settings) -> None:
                 is_active=False,
             )
         )
+    elif (
+        product is not None
+        and settings.supplier_enabled
+        and product.provider_product_id is None
+        and product.description_ar
+        == "اشتراك Gemini Pro. اضبط المدة والسعر وشروط المورد قبل التفعيل."
+    ):
+        # Hide the setup placeholder once the real supplier catalog is enabled.
+        product.is_active = False
 
     defaults = [
         PaymentChannel(
