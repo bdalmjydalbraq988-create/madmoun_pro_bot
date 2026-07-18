@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import Any
 
@@ -81,6 +82,7 @@ class VenteBotProvider:
                 "product_id": self._product_id(request.product_id),
                 "quantity": request.quantity,
                 "activation_identifier": request.customer_input or None,
+                "customer_reference": request.client_order_id,
                 "idempotency_key": request.client_order_id,
             },
         )
@@ -101,18 +103,69 @@ class VenteBotProvider:
         raw_status = str(result.get("status", "completed")).lower()
         if raw_status in {"cancelled", "canceled", "failed", "rejected"}:
             raise ProviderRejectedError(f"Supplier order ended with status {raw_status}")
-        delivery = result.get("delivery", result.get("result"))
+        delivery = VenteBotProvider._extract_delivery(result)
         completed = raw_status in {"completed", "success", "delivered"}
-        if completed and not delivery:
-            delivery = "تم تنفيذ وتفعيل الخدمة بنجاح لدى المورد."
-        status = ProviderResultStatus.COMPLETED if completed else ProviderResultStatus.PENDING
+        # A completed order without account_data is not delivered to our customer yet.
+        # Keep polling the documented GET endpoint instead of inventing a success message.
+        status = (
+            ProviderResultStatus.COMPLETED
+            if completed and delivery
+            else ProviderResultStatus.PENDING
+        )
         return ProvisionResult(
             status=status,
             external_order_id=str(external_id),
-            delivery=str(delivery) if delivery is not None else None,
+            delivery=delivery,
             provider_status=raw_status,
-            safe_metadata={"replayed": bool(data.get("replayed", False))},
+            safe_metadata={
+                "replayed": bool(data.get("replayed", data.get("idempotent", False))),
+                "balance_after": data.get("balance_after"),
+                "unit_price": data.get("unit_price"),
+                "total": data.get("total"),
+                "delivery_missing": completed and not delivery,
+            },
         )
+
+    @staticmethod
+    def _extract_delivery(order: dict[str, Any]) -> str | None:
+        values: list[str] = []
+        items = order.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                account_data = item.get("account_data")
+                if account_data is not None:
+                    text = VenteBotProvider._delivery_text(account_data)
+                    if text:
+                        values.append(text)
+        if values:
+            return "\n\n".join(dict.fromkeys(values))
+
+        for key in ("account_data", "delivery", "result"):
+            value = order.get(key)
+            if value is None:
+                continue
+            text = VenteBotProvider._delivery_text(value)
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _delivery_text(value: Any) -> str | None:
+        if isinstance(value, str):
+            return value.strip() or None
+        if isinstance(value, list):
+            parts = [VenteBotProvider._delivery_text(item) for item in value]
+            return "\n".join(part for part in parts if part) or None
+        if isinstance(value, dict):
+            for key in ("account_data", "url", "link", "code", "value", "credentials"):
+                if key in value:
+                    text = VenteBotProvider._delivery_text(value[key])
+                    if text:
+                        return text
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return str(value).strip() or None
 
     @staticmethod
     def _product_id(value: str) -> int:
