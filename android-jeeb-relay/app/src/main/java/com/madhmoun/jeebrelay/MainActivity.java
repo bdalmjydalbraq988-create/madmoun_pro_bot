@@ -26,6 +26,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -125,9 +126,7 @@ public final class MainActivity extends Activity {
         root.addView(save, matchTall());
 
         Button permission = button("منح صلاحية قراءة الإشعارات");
-        permission.setOnClickListener(
-                view -> startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-        );
+        permission.setOnClickListener(view -> openNotificationAccess());
         root.addView(permission, match());
 
         LinearLayout tests = row();
@@ -337,7 +336,12 @@ public final class MainActivity extends Activity {
             unique.put(packageName, new AppChoice(label, packageName));
         }
         List<AppChoice> result = new ArrayList<>(unique.values());
-        result.sort(Comparator.comparing(item -> item.label.toLowerCase()));
+        Collections.sort(result, new Comparator<AppChoice>() {
+            @Override
+            public int compare(AppChoice left, AppChoice right) {
+                return left.label.compareToIgnoreCase(right.label);
+            }
+        });
         result.add(0, new AppChoice("— اختر تطبيق جيب الرسمي —", ""));
         return result;
     }
@@ -373,9 +377,25 @@ public final class MainActivity extends Activity {
             toast("ولّد سرًا آمنًا أولًا");
             return;
         }
-        ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(
+                CLIPBOARD_SERVICE
+        );
+        if (clipboard == null) {
+            toast("تعذر فتح الحافظة على هذا الهاتف");
+            return;
+        }
         clipboard.setPrimaryClip(ClipData.newPlainText("JEEB_RELAY_SECRET", value));
         toast("تم نسخ السر؛ الصقه في متغير الخادم ثم امسح الحافظة");
+    }
+
+    private void openNotificationAccess() {
+        Intent direct = new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS");
+        if (direct.resolveActivity(getPackageManager()) != null) {
+            startActivity(direct);
+            return;
+        }
+        toast("افتح وصول الإشعارات ثم فعّل Madhmoun Jeeb Relay V3");
+        startActivity(new Intent(Settings.ACTION_SETTINGS));
     }
 
     private String newDeviceId() {
