@@ -15,7 +15,9 @@ public final class RelayJobService extends JobService {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     static void schedule(Context context) {
-        JobScheduler scheduler = context.getSystemService(JobScheduler.class);
+        JobScheduler scheduler = (JobScheduler) context.getSystemService(
+                Context.JOB_SCHEDULER_SERVICE
+        );
         if (scheduler == null) {
             return;
         }
