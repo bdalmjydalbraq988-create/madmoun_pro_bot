@@ -84,7 +84,14 @@ public final class JeebNotificationService extends NotificationListenerService {
                 add(parts, line);
             }
         }
-        return String.join("\n", parts);
+        StringBuilder result = new StringBuilder();
+        for (String part : parts) {
+            if (result.length() > 0) {
+                result.append('\n');
+            }
+            result.append(part);
+        }
+        return result.toString();
     }
 
     private static void add(Set<String> parts, CharSequence value) {

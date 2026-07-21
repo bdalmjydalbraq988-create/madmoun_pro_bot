@@ -3,11 +3,19 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:fullBackupContent="false"
-        android:label="Madhmoun Jeeb Relay"
+        android:label="Madhmoun Jeeb Relay V4"
         android:supportsRtl="true"
+        android:testOnly="false"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
 
@@ -23,7 +31,7 @@
         <service
             android:name=".JeebNotificationService"
             android:exported="true"
-            android:label="Madhmoun Jeeb Relay"
+            android:label="Madhmoun Jeeb Relay V4"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
