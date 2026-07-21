@@ -4,13 +4,12 @@ import asyncio
 import contextlib
 import html
 import logging
-import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from aiogram.types import Update
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -26,6 +25,7 @@ from app.models import Base, LedgerEntry, Order, Referral
 from app.services.delivery import delivery_html, is_placeholder_delivery
 from app.services.orders import OrderProcessor, OrderService
 from app.services.payments.binance import BinancePayClient
+from app.services.payments.jeeb_relay import JeebRelayAuthError, verify_jeeb_relay_request
 from app.services.payments.service import JeebPaymentEvent, PaymentError, PaymentService
 from app.services.providers.quantumvault import VenteBotProvider
 from app.services.supplier_catalog import sync_supplier_catalog
@@ -107,7 +107,9 @@ async def lifespan(app: FastAPI):
         await seed_defaults(session, settings)
 
     cipher = PayloadCipher(settings.data_encryption_key.get_secret_value())
-    payment_service = PaymentService()
+    payment_service = PaymentService(
+        jeeb_intent_ttl_minutes=settings.jeeb_intent_ttl_minutes,
+    )
     order_service = OrderService(cipher)
     binance = None
     if settings.binance_pay_enabled:
@@ -310,23 +312,52 @@ class JeebRelayPayload(BaseModel):
     amount: Decimal = Field(gt=0)
     currency: str = Field(default="YER", min_length=2, max_length=8)
     sender_account: str = Field(min_length=6, max_length=40)
-    occurred_at: datetime | None = None
+    occurred_at: datetime
 
 
 @app.post("/webhooks/jeeb-relay", include_in_schema=False)
 async def jeeb_notification_relay(
+    request: Request,
     payload: JeebRelayPayload,
-    x_jeeb_relay_secret: str | None = Header(default=None),
+    x_jeeb_relay_version: str | None = Header(default=None),
+    x_jeeb_device_id: str | None = Header(default=None),
+    x_jeeb_timestamp: str | None = Header(default=None),
+    x_jeeb_nonce: str | None = Header(default=None),
+    x_jeeb_signature: str | None = Header(default=None),
 ) -> dict[str, bool | str]:
     settings = app.state.settings
     if not settings.jeeb_auto_confirm_enabled:
         raise HTTPException(status_code=503, detail="Jeeb auto confirmation is disabled")
-    expected = settings.jeeb_relay_secret.get_secret_value()
-    if not x_jeeb_relay_secret or not secrets.compare_digest(
-        x_jeeb_relay_secret,
-        expected,
-    ):
-        raise HTTPException(status_code=403, detail="Invalid Jeeb relay secret")
+    raw_body = await request.body()
+    if len(raw_body) > 4096:
+        raise HTTPException(status_code=413, detail="Relay payload is too large")
+    try:
+        verified = verify_jeeb_relay_request(
+            secret=settings.jeeb_relay_secret.get_secret_value(),
+            expected_device_id=settings.jeeb_relay_device_id,
+            body=raw_body,
+            version=x_jeeb_relay_version,
+            device_id=x_jeeb_device_id,
+            timestamp=x_jeeb_timestamp,
+            nonce=x_jeeb_nonce,
+            signature=x_jeeb_signature,
+            tolerance_seconds=settings.jeeb_relay_tolerance_seconds,
+        )
+    except JeebRelayAuthError as exc:
+        logger.warning("Rejected Jeeb relay request: %s", exc)
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Jeeb relay authentication",
+        ) from exc
+
+    if payload.occurred_at.tzinfo is None:
+        raise HTTPException(status_code=422, detail="occurred_at must include a timezone")
+    now = datetime.now(UTC)
+    occurred_at = payload.occurred_at.astimezone(UTC)
+    if occurred_at > now + timedelta(minutes=10):
+        raise HTTPException(status_code=409, detail="Jeeb event timestamp is in the future")
+    if occurred_at < now - timedelta(hours=settings.jeeb_event_max_age_hours):
+        raise HTTPException(status_code=409, detail="Jeeb event is too old")
 
     async with app.state.session_factory() as session:
         try:
@@ -337,7 +368,10 @@ async def jeeb_notification_relay(
                     amount=payload.amount,
                     currency=payload.currency,
                     sender_account=payload.sender_account,
-                    occurred_at=payload.occurred_at,
+                    occurred_at=occurred_at,
+                    source_device_id=verified.device_id,
+                    relay_nonce=verified.nonce,
+                    payload_sha256=verified.body_sha256,
                 ),
             )
             await session.commit()
@@ -356,10 +390,38 @@ async def jeeb_notification_relay(
                 )
             except Exception:
                 logger.exception("Could not notify customer about confirmed Jeeb payment")
+    elif payment is not None and payment.status.value == "review_required":
+        bot = app.state.bot
+        if bot is not None:
+            try:
+                await bot.send_message(
+                    payment.user_id,
+                    f"⚠️ شحن جيب <code>{payment.public_code}</code> لم يطابق جميع البيانات. "
+                    "لم يُضف أي رصيد وأُرسل الطلب للمراجعة.",
+                )
+                for admin_id in settings.admin_ids:
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ شحن جيب <code>{payment.public_code}</code> يحتاج مراجعة. "
+                        "لم تتم إضافة الرصيد تلقائيًا.",
+                    )
+            except Exception:
+                logger.exception("Could not notify about Jeeb payment mismatch")
     return {
         "ok": True,
         "matched": payment is not None,
         "status": payment.status.value if payment is not None else "awaiting_customer_claim",
+    }
+
+
+@app.get("/webhooks/jeeb-relay/health", include_in_schema=False)
+async def jeeb_relay_health() -> dict[str, bool | str]:
+    """Non-sensitive readiness check used by the owner's relay phone."""
+
+    return {
+        "ok": True,
+        "enabled": app.state.settings.jeeb_auto_confirm_enabled,
+        "protocol": "hmac-sha256-v1",
     }
 
 
