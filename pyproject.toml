@@ -1,11 +1,11 @@
 [project]
 name = "digital-store-bot"
-version = "0.3.0"
+version = "0.5.1"
 description = "Secure Arabic Telegram storefront for digital services"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "aiogram>=3.20,<4",
+  "aiogram>=3.29,<4",
   "aiosqlite>=0.21,<1",
   "alembic>=1.15,<2",
   "asyncpg>=0.30,<1",
