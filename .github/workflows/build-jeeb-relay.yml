@@ -52,11 +52,26 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
-      - name: Build installable debug APK
-        run: gradle -p android-jeeb-relay --no-daemon assembleDebug
+      - name: Build end-user release APK
+        run: gradle -p android-jeeb-relay --no-daemon assembleRelease
+      - name: Verify package, alignment, SDK and signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="android-jeeb-relay/app/build/outputs/apk/release/app-release.apk"
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS/zipalign" -c -v 4 "$APK"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK"
+          "$BUILD_TOOLS/aapt" dump badging "$APK" | tee /tmp/apk-badging.txt
+          grep -F "package: name='com.madhmoun.jeebrelay.universal' versionCode='4' versionName='1.0.3'" /tmp/apk-badging.txt
+          grep -F "sdkVersion:'21'" /tmp/apk-badging.txt
+          if grep -Fq "application-debuggable" /tmp/apk-badging.txt; then
+            echo "Refusing to publish a debuggable APK" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: madhmoun-jeeb-relay-apk
-          path: android-jeeb-relay/app/build/outputs/apk/debug/app-debug.apk
+          name: madhmoun-jeeb-relay-release-apk
+          path: android-jeeb-relay/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
