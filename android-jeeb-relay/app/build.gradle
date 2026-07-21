@@ -7,12 +7,12 @@ android {
     compileSdk 35
 
     defaultConfig {
-        // Keep the Android 5 build separate from every previous test package/signature.
-        applicationId "com.madhmoun.jeebrelay.legacy"
+        // A final end-user package, separate from every rejected debug test package.
+        applicationId "com.madhmoun.jeebrelay.universal"
         minSdk 21
         targetSdk 35
-        versionCode 3
-        versionName "1.0.2"
+        versionCode 4
+        versionName "1.0.3"
     }
 
     signingConfigs {
@@ -21,7 +21,7 @@ android {
             enableV1Signing = true
             enableV2Signing = true
             enableV3Signing = true
-            enableV4Signing = true
+            enableV4Signing = false
         }
     }
 
@@ -30,7 +30,9 @@ android {
             signingConfig signingConfigs.debug
         }
         release {
-            minifyEnabled true
+            // Produce a normal installable release APK, never a test-only/debuggable APK.
+            signingConfig signingConfigs.debug
+            minifyEnabled false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }
     }
