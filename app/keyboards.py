@@ -144,6 +144,19 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def jeeb_pending_keyboard(public_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📎 رفع إثبات للمراجعة",
+                    callback_data=f"jeebproof:{public_code}",
+                )
+            ]
+        ]
+    )
+
+
 def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
