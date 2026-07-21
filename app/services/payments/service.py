@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.enums import LedgerKind, PaymentKind, PaymentStatus
-from app.models import Payment, PaymentChannel
+from app.models import JeebPaymentIntent, JeebTransactionEvent, Payment, PaymentChannel
 from app.services.audit import add_audit
 from app.services.payments.binance import BinancePaymentEvent
 from app.services.wallet import WalletMutation, WalletService, money
@@ -29,6 +29,23 @@ class PaymentQuote:
     settlement_currency: str
     fee_percent: Decimal
     rate: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class JeebPaymentEvent:
+    transaction_id: str
+    amount: Decimal
+    currency: str
+    sender_account: str
+    occurred_at: datetime | None = None
+
+
+def normalize_jeeb_transaction_id(value: str) -> str:
+    return value.strip().upper()
+
+
+def normalize_jeeb_account(value: str) -> str:
+    return "".join(character for character in value if character.isdigit())
 
 
 def payment_code() -> str:
@@ -78,10 +95,15 @@ class PaymentService:
         quote: PaymentQuote,
         payer_reference: str | None = None,
         proof_file_id: str | None = None,
+        allow_unproved_manual: bool = False,
     ) -> Payment:
         if not channel.is_active:
             raise PaymentError("طريقة الدفع غير متاحة حاليًا")
-        if channel.kind is PaymentKind.MANUAL and not proof_file_id:
+        if (
+            channel.kind is PaymentKind.MANUAL
+            and not proof_file_id
+            and not allow_unproved_manual
+        ):
             raise PaymentError("صورة إثبات التحويل مطلوبة")
         if payer_reference:
             existing = await session.scalar(
@@ -119,6 +141,180 @@ class PaymentService:
         )
         return payment
 
+    async def create_jeeb_pending(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: int,
+        channel: PaymentChannel,
+        quote: PaymentQuote,
+        transaction_id: str,
+        payer_account: str,
+    ) -> tuple[Payment, WalletMutation | None]:
+        if channel.code != "jeeb" or channel.kind is not PaymentKind.MANUAL:
+            raise PaymentError("طريقة الدفع ليست محفظة جيب")
+        transaction_id = normalize_jeeb_transaction_id(transaction_id)
+        payer_account = normalize_jeeb_account(payer_account)
+        if not 3 <= len(transaction_id) <= 200:
+            raise PaymentError("رقم عملية جيب غير صالح")
+        if not 6 <= len(payer_account) <= 20:
+            raise PaymentError("رقم الحساب المحوّل منه غير صالح")
+        payment = await self.create_pending(
+            session,
+            user_id=user_id,
+            channel=channel,
+            quote=quote,
+            payer_reference=transaction_id,
+            allow_unproved_manual=True,
+        )
+        session.add(JeebPaymentIntent(payment_id=payment.id, payer_account=payer_account))
+        await session.flush()
+        event = await session.scalar(
+            select(JeebTransactionEvent)
+            .where(JeebTransactionEvent.transaction_id == transaction_id)
+            .with_for_update()
+        )
+        if event is None:
+            return payment, None
+        matched_payment, mutation = await self._match_jeeb_event(session, event)
+        return matched_payment or payment, mutation
+
+    async def receive_jeeb_event(
+        self,
+        session: AsyncSession,
+        event: JeebPaymentEvent,
+    ) -> tuple[JeebTransactionEvent, Payment | None, WalletMutation | None]:
+        transaction_id = normalize_jeeb_transaction_id(event.transaction_id)
+        sender_account = normalize_jeeb_account(event.sender_account)
+        currency = event.currency.strip().upper()
+        amount = money(event.amount)
+        if not 3 <= len(transaction_id) <= 200:
+            raise PaymentError("Invalid Jeeb transaction ID")
+        if not 6 <= len(sender_account) <= 20:
+            raise PaymentError("Invalid Jeeb sender account")
+        if amount <= 0 or len(currency) > 8:
+            raise PaymentError("Invalid Jeeb amount or currency")
+
+        stored = await session.scalar(
+            select(JeebTransactionEvent)
+            .where(JeebTransactionEvent.transaction_id == transaction_id)
+            .with_for_update()
+        )
+        if stored is None:
+            stored = JeebTransactionEvent(
+                transaction_id=transaction_id,
+                amount=amount,
+                currency=currency,
+                sender_account=sender_account,
+                occurred_at=event.occurred_at,
+            )
+            session.add(stored)
+            await session.flush()
+        elif (
+            money(stored.amount) != amount
+            or stored.currency.upper() != currency
+            or stored.sender_account != sender_account
+        ):
+            raise PaymentError("Conflicting replay of a Jeeb transaction")
+
+        payment, mutation = await self._match_jeeb_event(session, stored)
+        return stored, payment, mutation
+
+    async def _match_jeeb_event(
+        self,
+        session: AsyncSession,
+        event: JeebTransactionEvent,
+    ) -> tuple[Payment | None, WalletMutation | None]:
+        if event.matched_payment_id is not None:
+            payment = await session.get(Payment, event.matched_payment_id)
+            if payment is None or payment.status is not PaymentStatus.CONFIRMED:
+                return payment, None
+            mutation = await self.wallet.credit(
+                session,
+                user_id=payment.user_id,
+                amount=payment.credit_amount,
+                kind=LedgerKind.DEPOSIT,
+                idempotency_key=f"payment:{payment.id}",
+                reference_type="payment",
+                reference_id=str(payment.id),
+                note="Jeeb trusted notification relay deposit",
+            )
+            return payment, mutation
+
+        payment = await session.scalar(
+            select(Payment)
+            .where(
+                Payment.channel_code == "jeeb",
+                Payment.payer_reference == event.transaction_id,
+            )
+            .with_for_update()
+        )
+        if payment is None:
+            return None, None
+        intent = await session.get(JeebPaymentIntent, payment.id)
+        if intent is None:
+            # Old/manual deposits must keep the existing admin-proof workflow.
+            return payment, None
+        if payment.status is PaymentStatus.CONFIRMED:
+            event.matched_payment_id = payment.id
+            mutation = await self.wallet.credit(
+                session,
+                user_id=payment.user_id,
+                amount=payment.credit_amount,
+                kind=LedgerKind.DEPOSIT,
+                idempotency_key=f"payment:{payment.id}",
+                reference_type="payment",
+                reference_id=str(payment.id),
+                note="Jeeb trusted notification relay deposit",
+            )
+            return payment, mutation
+        if payment.status is not PaymentStatus.PENDING:
+            return payment, None
+
+        mismatch: dict[str, str] = {}
+        if money(event.amount) != money(payment.expected_amount):
+            mismatch["amount"] = "mismatch"
+        if event.currency.upper() != payment.settlement_currency.upper():
+            mismatch["currency"] = "mismatch"
+        if event.sender_account != intent.payer_account:
+            mismatch["sender_account"] = "mismatch"
+        if mismatch:
+            event.matched_payment_id = payment.id
+            payment.status = PaymentStatus.REVIEW_REQUIRED
+            add_audit(
+                session,
+                actor_user_id=None,
+                action="payment.jeeb_mismatch",
+                entity_type="payment",
+                entity_id=str(payment.id),
+                metadata=mismatch,
+            )
+            return payment, None
+
+        event.matched_payment_id = payment.id
+        payment.status = PaymentStatus.CONFIRMED
+        payment.confirmed_at = datetime.now(UTC)
+        payment.external_id = event.transaction_id
+        mutation = await self.wallet.credit(
+            session,
+            user_id=payment.user_id,
+            amount=payment.credit_amount,
+            kind=LedgerKind.DEPOSIT,
+            idempotency_key=f"payment:{payment.id}",
+            reference_type="payment",
+            reference_id=str(payment.id),
+            note="Jeeb trusted notification relay deposit",
+        )
+        add_audit(
+            session,
+            actor_user_id=None,
+            action="payment.jeeb_confirmed",
+            entity_type="payment",
+            entity_id=str(payment.id),
+            metadata={"transaction_id": event.transaction_id},
+        )
+        return payment, mutation
+
     async def approve_manual(
         self,
         session: AsyncSession,
@@ -149,7 +345,7 @@ class PaymentService:
                 note=f"Confirmed {payment.channel_code} deposit",
             )
             return payment, mutation
-        if payment.status is not PaymentStatus.PENDING:
+        if payment.status not in {PaymentStatus.PENDING, PaymentStatus.REVIEW_REQUIRED}:
             raise PaymentError(f"لا يمكن اعتماد طلب حالته {payment.status.value}")
 
         payment.status = PaymentStatus.CONFIRMED
@@ -194,7 +390,7 @@ class PaymentService:
             raise PaymentError("طلب الشحن غير موجود")
         if payment.channel.kind is not PaymentKind.MANUAL:
             raise PaymentError("لا يمكن رفض الدفع التلقائي يدويًا")
-        if payment.status is not PaymentStatus.PENDING:
+        if payment.status not in {PaymentStatus.PENDING, PaymentStatus.REVIEW_REQUIRED}:
             raise PaymentError("تمت معالجة طلب الشحن سابقًا")
         payment.status = PaymentStatus.REJECTED
         payment.rejection_reason = reason[:300]

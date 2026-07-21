@@ -53,12 +53,18 @@ class Settings(BaseSettings):
     supplier_activation_identifier_path: str = (
         "/api/reseller/orders/{order_id}/activation-identifier"
     )
+    supplier_catalog_sync_minutes: int = 60
 
     binance_pay_enabled: bool = False
     binance_pay_api_key: SecretStr = SecretStr("")
     binance_pay_secret_key: SecretStr = SecretStr("")
     binance_pay_base_url: str = "https://bpay.binanceapi.com"
     binance_webhook_tolerance_seconds: int = 300
+
+    # Personal Jeeb wallets do not expose a verified public API. Automatic
+    # confirmation therefore accepts only events relayed by the owner's phone.
+    jeeb_auto_confirm_enabled: bool = False
+    jeeb_relay_secret: SecretStr = SecretStr("")
 
     order_worker_interval_seconds: float = 5.0
     order_max_retries: int = 3
@@ -83,6 +89,11 @@ class Settings(BaseSettings):
                 raise ValueError("BINANCE_PAY_API_KEY is required when Binance Pay is enabled")
             if not self.binance_pay_secret_key.get_secret_value():
                 raise ValueError("BINANCE_PAY_SECRET_KEY is required when Binance Pay is enabled")
+        if self.jeeb_auto_confirm_enabled and len(self.jeeb_relay_secret.get_secret_value()) < 32:
+            raise ValueError(
+                "JEEB_RELAY_SECRET must have at least 32 characters "
+                "when Jeeb auto confirm is enabled"
+            )
         if self.app_env == "production":
             if not self.bot_token.get_secret_value():
                 raise ValueError("BOT_TOKEN is required in production")

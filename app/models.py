@@ -9,6 +9,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -182,6 +183,18 @@ class SupplierSyncConfig(TimestampMixin, Base):
     last_sync_message: Mapped[str] = mapped_column(String(500), default="")
 
 
+class ReferralProgramConfig(TimestampMixin, Base):
+    """Single-row, admin-controlled referral reward policy."""
+
+    __tablename__ = "referral_program_configs"
+
+    code: Mapped[str] = mapped_column(String(20), primary_key=True, default="default")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    referrer_reward: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    invitee_reward: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    minimum_order_amount: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+
+
 class Order(TimestampMixin, Base):
     __tablename__ = "orders"
     __table_args__ = (
@@ -220,6 +233,34 @@ class Order(TimestampMixin, Base):
 
     user: Mapped[User] = relationship(back_populates="orders")
     product: Mapped[Product] = relationship(back_populates="orders")
+
+
+class Referral(TimestampMixin, Base):
+    """Immutable inviter assignment for one newly registered customer."""
+
+    __tablename__ = "referrals"
+    __table_args__ = (
+        CheckConstraint("invitee_id <> referrer_id", name="ck_referral_not_self"),
+        Index("ix_referrals_referrer_created", "referrer_id", "created_at"),
+    )
+
+    invitee_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    referrer_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="RESTRICT"),
+        index=True,
+    )
+    qualified_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("orders.id", ondelete="SET NULL"),
+        unique=True,
+    )
+    referrer_reward_amount: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    invitee_reward_amount: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    rewarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PaymentChannel(TimestampMixin, Base):
@@ -277,6 +318,34 @@ class Payment(TimestampMixin, Base):
 
     user: Mapped[User] = relationship(back_populates="payments")
     channel: Mapped[PaymentChannel] = relationship(back_populates="payments")
+
+
+class JeebPaymentIntent(TimestampMixin, Base):
+    """Extra payer identity required before a personal-wallet event may auto-credit."""
+
+    __tablename__ = "jeeb_payment_intents"
+
+    payment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("payments.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    payer_account: Mapped[str] = mapped_column(String(40))
+
+
+class JeebTransactionEvent(TimestampMixin, Base):
+    """One immutable transfer notification relayed from the wallet owner's phone."""
+
+    __tablename__ = "jeeb_transaction_events"
+
+    transaction_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    amount: Mapped[Decimal] = mapped_column(MONEY)
+    currency: Mapped[str] = mapped_column(String(8), default="YER")
+    sender_account: Mapped[str] = mapped_column(String(40))
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    matched_payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("payments.id", ondelete="SET NULL"),
+        unique=True,
+    )
 
 
 class AuditLog(Base):

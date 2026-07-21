@@ -11,6 +11,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
+from app.formatting import money_label
 from app.models import Category, PaymentChannel, Product, SupplierCatalogItem
 from app.services.delivery import first_http_url
 
@@ -19,6 +20,7 @@ def main_menu(is_admin: bool = False):
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="🛍 المتجر"), KeyboardButton(text="💰 رصيدي"))
     builder.row(KeyboardButton(text="➕ شحن الرصيد"), KeyboardButton(text="📦 طلباتي"))
+    builder.row(KeyboardButton(text="🎁 ادعُ واربح"), KeyboardButton(text="🆔 رقمي"))
     builder.row(KeyboardButton(text="🧑‍💻 الدعم"))
     if is_admin:
         builder.row(KeyboardButton(text="⚙️ لوحة الأدمن"))
@@ -38,14 +40,24 @@ def categories_keyboard(categories: Iterable[Category]) -> InlineKeyboardMarkup:
 def _service_icon(name: str) -> str:
     search = name.casefold()
     rules = (
-        ("✨", ("gemini", "جيمناي")),
-        ("🛸", ("grok",)),
-        ("🎬", ("netflix", "prime", "youtube", "شاهد")),
+        ("✨", ("gemini", "جيمناي", "google ai")),
+        ("🤖", ("chatgpt", "openai", "شات جي بي تي")),
+        ("🧠", ("claude",)),
+        ("🔎", ("perplexity",)),
+        ("🛸", ("grok", "x ai", "xai")),
+        ("📺", ("amazon prime", "prime video")),
+        ("🎬", ("netflix", "disney", "shahid", "شاهد", "osn")),
+        ("▶️", ("youtube", "يوتيوب")),
         ("🎵", ("spotify", "سبوتيفاي")),
-        ("🎨", ("capcut", "canva", "adobe", "figma")),
-        ("🛡", ("vpn", "surfshark", "nord")),
-        ("🎓", ("coursera", "udemy", "linkedin")),
-        ("📧", ("gmail",)),
+        ("✂️", ("capcut",)),
+        ("🎨", ("canva", "adobe", "figma")),
+        ("🏗️", ("autodesk",)),
+        ("🛡️", ("vpn", "surfshark", "nord", "expressvpn")),
+        ("🎓", ("coursera", "udemy", "duolingo")),
+        ("💼", ("linkedin", "microsoft", "office", "notion")),
+        ("📧", ("gmail", "google mail")),
+        ("☁️", ("google one", "drive")),
+        ("⭐", ("telegram", "premium")),
     )
     for icon, keywords in rules:
         if any(keyword in search for keyword in keywords):
@@ -64,7 +76,7 @@ def products_keyboard(
         stock = ""
         if snapshot is not None and snapshot.stock is not None:
             stock = f" | 📦 {snapshot.stock}"
-        suffix = f" | ${product.sale_price:g}{stock}"
+        suffix = f" | {money_label(product.sale_price, product.currency)}{stock}"
         icon = _service_icon(product.name_ar)
         max_name = max(12, 62 - len(icon) - len(suffix))
         display_name = (
@@ -72,12 +84,14 @@ def products_keyboard(
             if len(product.name_ar) <= max_name
             else f"{product.name_ar[: max_name - 1]}…"
         )
-        builder.button(
-            text=f"{icon} {display_name}{suffix}",
-            callback_data=f"prd:{product.id}",
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{icon} {display_name}{suffix}",
+                callback_data=f"prd:{product.id}",
+                style="success",
+            )
         )
-    builder.button(text="↩️ الأقسام", callback_data="catalog")
-    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="↩️ الأقسام", callback_data="catalog", style="primary"))
     return builder.as_markup()
 
 
@@ -147,7 +161,106 @@ def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="➕ إضافة خدمة", callback_data="adm:add_product")],
             [InlineKeyboardButton(text="➕ إضافة قسم", callback_data="adm:add_category")],
+            [
+                InlineKeyboardButton(text="👥 المشتركون", callback_data="adm:users"),
+                InlineKeyboardButton(text="🔎 بحث بالمعرف", callback_data="adm:usersearch"),
+            ],
             [InlineKeyboardButton(text="🔄 المورد والمزامنة", callback_data="adm:supplier")],
+            [InlineKeyboardButton(text="🎁 نظام الإحالة", callback_data="adm:referrals")],
+        ]
+    )
+
+
+def referral_keyboard(link: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📋 نسخ رابط دعوتي",
+                    copy_text=CopyTextButton(text=link),
+                    style="primary",
+                )
+            ],
+            [InlineKeyboardButton(text="📤 مشاركة الرابط", url=f"https://t.me/share/url?url={link}")],
+        ]
+    )
+
+
+def admin_referral_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle = "🔴 إيقاف المكافآت" if enabled else "🟢 تشغيل المكافآت"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle, callback_data="adm:referrals:toggle")],
+            [
+                InlineKeyboardButton(
+                    text="💰 مكافأة الداعي",
+                    callback_data="adm:referrals:set:referrer",
+                ),
+                InlineKeyboardButton(
+                    text="🎉 مكافأة المدعو",
+                    callback_data="adm:referrals:set:invitee",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧾 الحد الأدنى للطلب",
+                    callback_data="adm:referrals:set:minimum",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ لوحة الإدارة", callback_data="adm:dashboard")],
+        ]
+    )
+
+
+def admin_user_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📋 نسخ رقم العميل",
+                    copy_text=CopyTextButton(text=str(user_id)),
+                    style="primary",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 طلبات العميل",
+                    callback_data=f"adm:userorders:{user_id}",
+                ),
+                InlineKeyboardButton(
+                    text="💰 تعديل الرصيد",
+                    callback_data=f"adm:userwallet:{user_id}",
+                ),
+            ],
+            [InlineKeyboardButton(text="↩️ المشتركون", callback_data="adm:users")],
+        ]
+    )
+
+
+def admin_user_orders_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="↩️ بيانات العميل",
+                    callback_data=f"adm:user:{user_id}",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ المشتركون", callback_data="adm:users")],
+        ]
+    )
+
+
+def user_account_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📋 نسخ رقم حسابي",
+                    copy_text=CopyTextButton(text=str(user_id)),
+                    style="primary",
+                )
+            ]
         ]
     )
 
@@ -192,6 +305,12 @@ def admin_supplier_keyboard(*, auto_activate: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="💵 أقل ربح", callback_data="adm:supplier:minprofit"),
             ],
             [InlineKeyboardButton(text=activation_text, callback_data="adm:supplier:autoactivate")],
+            [
+                InlineKeyboardButton(
+                    text="🩺 إصلاح وإظهار الخدمات المتاحة",
+                    callback_data="adm:supplier:repair",
+                )
+            ],
             [InlineKeyboardButton(text="↩️ لوحة الإدارة", callback_data="adm:dashboard")],
         ]
     )

@@ -4,23 +4,29 @@ import asyncio
 import contextlib
 import html
 import logging
+import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime
+from decimal import Decimal
 
 from aiogram.types import Update
 from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from app import __version__
 from app.bootstrap import seed_defaults
 from app.bot import build_bot, build_dispatcher
 from app.config import get_settings
 from app.crypto import PayloadCipher
 from app.db import create_engine, create_session_factory
+from app.formatting import money_label
 from app.keyboards import delivery_keyboard
-from app.models import Base, LedgerEntry, Order
+from app.models import Base, LedgerEntry, Order, Referral
 from app.services.delivery import delivery_html, is_placeholder_delivery
 from app.services.orders import OrderProcessor, OrderService
 from app.services.payments.binance import BinancePayClient
-from app.services.payments.service import PaymentService
+from app.services.payments.service import JeebPaymentEvent, PaymentError, PaymentService
 from app.services.providers.quantumvault import VenteBotProvider
 from app.services.supplier_catalog import sync_supplier_catalog
 from app.web.routes import router as web_router
@@ -63,10 +69,13 @@ async def supplier_catalog_loop(
                 )
                 await session.commit()
                 logger.info(
-                    "Automatic supplier catalog sync completed: received=%s created=%s updated=%s",
+                    "Automatic supplier catalog sync completed: "
+                    "received=%s created=%s updated=%s deactivated=%s skipped=%s",
                     result.received,
                     result.created,
                     result.updated,
+                    result.deactivated,
+                    result.skipped,
                 )
         except asyncio.CancelledError:
             raise
@@ -78,6 +87,11 @@ async def supplier_catalog_loop(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    logger.info(
+        "[MADMOUN RELEASE %s] Starting with ADMIN_IDS=%s",
+        __version__,
+        settings.admin_ids,
+    )
     if not settings.data_encryption_key.get_secret_value():
         raise RuntimeError(
             "DATA_ENCRYPTION_KEY is required. Run `python -m app.cli generate-key` "
@@ -142,14 +156,20 @@ async def lifespan(app: FastAPI):
                         LedgerEntry.idempotency_key == f"order:purchase:{order.id}"
                     )
                 )
+                referral = await session.scalar(
+                    select(Referral).where(
+                        Referral.qualified_order_id == order.id,
+                        Referral.rewarded_at.is_not(None),
+                    )
+                )
             paid = abs(purchase_entry.amount) if purchase_entry is not None else order.total_amount
             remaining = (
-                f"{purchase_entry.balance_after:g} {order.currency}"
+                money_label(purchase_entry.balance_after, order.currency)
                 if purchase_entry is not None
                 else "راجع محفظتك"
             )
             before_line = (
-                f"الرصيد قبل: <b>{purchase_entry.balance_before:g} {order.currency}</b>\n"
+                f"الرصيد قبل: <b>{money_label(purchase_entry.balance_before, order.currency)}</b>\n"
                 if purchase_entry is not None
                 else ""
             )
@@ -157,10 +177,23 @@ async def lifespan(app: FastAPI):
                 f"✅ <b>اكتمل طلبك</b> <code>{order.public_code}</code>\n"
                 f"الخدمة: {html.escape(order.product_name_snapshot)}\n\n"
                 f"{before_line}"
-                f"تم الخصم: <b>{paid:g} {order.currency}</b>\n"
+                f"تم الخصم: <b>{money_label(paid, order.currency)}</b>\n"
                 f"الرصيد المتبقي: <b>{remaining}</b>"
             )
             await bot.send_message(order.user_id, text)
+            if referral is not None:
+                if referral.invitee_reward_amount > 0:
+                    await bot.send_message(
+                        order.user_id,
+                        "🎉 أُضيفت هدية الإحالة إلى رصيدك: "
+                        f"<b>{money_label(referral.invitee_reward_amount)}</b>",
+                    )
+                if referral.referrer_reward_amount > 0:
+                    await bot.send_message(
+                        referral.referrer_id,
+                        "🎁 اكتملت أول عملية شراء لأحد المدعوين، وأُضيفت مكافأتك: "
+                        f"<b>{money_label(referral.referrer_reward_amount)}</b>",
+                    )
             delivery = (
                 cipher.decrypt(order.delivery_encrypted) if order.delivery_encrypted else None
             )
@@ -264,12 +297,70 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Digital Store Bot",
-    version="0.3.0",
+    version=__version__,
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
 )
 app.include_router(web_router)
+
+
+class JeebRelayPayload(BaseModel):
+    transaction_id: str = Field(min_length=3, max_length=200)
+    amount: Decimal = Field(gt=0)
+    currency: str = Field(default="YER", min_length=2, max_length=8)
+    sender_account: str = Field(min_length=6, max_length=40)
+    occurred_at: datetime | None = None
+
+
+@app.post("/webhooks/jeeb-relay", include_in_schema=False)
+async def jeeb_notification_relay(
+    payload: JeebRelayPayload,
+    x_jeeb_relay_secret: str | None = Header(default=None),
+) -> dict[str, bool | str]:
+    settings = app.state.settings
+    if not settings.jeeb_auto_confirm_enabled:
+        raise HTTPException(status_code=503, detail="Jeeb auto confirmation is disabled")
+    expected = settings.jeeb_relay_secret.get_secret_value()
+    if not x_jeeb_relay_secret or not secrets.compare_digest(
+        x_jeeb_relay_secret,
+        expected,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid Jeeb relay secret")
+
+    async with app.state.session_factory() as session:
+        try:
+            _, payment, mutation = await app.state.payment_service.receive_jeeb_event(
+                session,
+                JeebPaymentEvent(
+                    transaction_id=payload.transaction_id,
+                    amount=payload.amount,
+                    currency=payload.currency,
+                    sender_account=payload.sender_account,
+                    occurred_at=payload.occurred_at,
+                ),
+            )
+            await session.commit()
+        except PaymentError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if payment is not None and mutation is not None and not mutation.was_replayed:
+        bot = app.state.bot
+        if bot is not None:
+            try:
+                await bot.send_message(
+                    payment.user_id,
+                    f"✅ تم تأكيد شحن جيب <code>{payment.public_code}</code> تلقائيًا.\n"
+                    f"الرصيد الجديد: <b>{money_label(mutation.balance_after)}</b>",
+                )
+            except Exception:
+                logger.exception("Could not notify customer about confirmed Jeeb payment")
+    return {
+        "ok": True,
+        "matched": payment is not None,
+        "status": payment.status.value if payment is not None else "awaiting_customer_claim",
+    }
 
 
 @app.post("/telegram/{path_secret}", include_in_schema=False)
