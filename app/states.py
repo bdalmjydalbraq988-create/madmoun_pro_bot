@@ -9,6 +9,7 @@ class BuyFlow(StatesGroup):
 class DepositFlow(StatesGroup):
     amount = State()
     reference = State()
+    payer_account = State()
     proof = State()
 
 
@@ -24,6 +25,10 @@ class AdminWalletFlow(StatesGroup):
     user_id = State()
     amount = State()
     reason = State()
+
+
+class AdminUserLookupFlow(StatesGroup):
+    user_id = State()
 
 
 class AdminProductFlow(StatesGroup):
@@ -69,4 +74,8 @@ class AdminSupplierMarkupFlow(StatesGroup):
 
 
 class AdminSupplierMinimumProfitFlow(StatesGroup):
+    value = State()
+
+
+class AdminReferralConfigFlow(StatesGroup):
     value = State()
