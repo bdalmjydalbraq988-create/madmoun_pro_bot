@@ -3,8 +3,10 @@ package com.madhmoun.jeebrelay;
 import org.json.JSONObject;
 
 import java.math.BigDecimal;
-import java.time.Instant;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Locale;
+import java.util.TimeZone;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -58,8 +60,17 @@ final class NotificationParser {
                 transactionId,
                 amount.toPlainString(),
                 sender,
-                Instant.ofEpochMilli(occurredAtMillis).toString()
+                isoUtc(occurredAtMillis)
         );
+    }
+
+    private static String isoUtc(long occurredAtMillis) {
+        SimpleDateFormat formatter = new SimpleDateFormat(
+                "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+                Locale.US
+        );
+        formatter.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return formatter.format(new Date(occurredAtMillis));
     }
 
     private static String capture(String expression, String raw, String label)
