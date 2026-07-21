@@ -6,6 +6,7 @@ import android.content.SharedPreferences;
 import org.json.JSONArray;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 final class PendingQueue {
@@ -50,7 +51,12 @@ final class PendingQueue {
 
     static synchronized void remove(Context context, String nonce) {
         List<RelayEvent> events = read(context);
-        events.removeIf(item -> item.nonce.equals(nonce));
+        Iterator<RelayEvent> iterator = events.iterator();
+        while (iterator.hasNext()) {
+            if (iterator.next().nonce.equals(nonce)) {
+                iterator.remove();
+            }
+        }
         write(context, events);
     }
 
