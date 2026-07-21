@@ -30,20 +30,20 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "INFO"
-    store_name: str = "مضمون برو"
+    store_name: str = "متجري الرقمي"
     support_username: str = "@support"
     public_base_url: str = "http://localhost:8000"
     webhook_secret_path: SecretStr = SecretStr("change-me")
 
     bot_token: SecretStr = SecretStr("")
-    admin_ids: AdminIds = Field(default_factory=lambda: [8884716304])
+    admin_ids: AdminIds = Field(default_factory=list)
 
     database_url: str = "sqlite+aiosqlite:///./store.db"
     redis_url: str = "redis://localhost:6379/0"
     data_encryption_key: SecretStr = SecretStr("")
 
     supplier_enabled: bool = False
-    supplier_base_url: str = "https://ventetelegrambotrailway-production.up.railway.app"
+    supplier_base_url: str = ""
     supplier_api_key: SecretStr = SecretStr("")
     supplier_me_path: str = "/api/reseller/me"
     supplier_products_path: str = "/api/reseller/products"
@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     # confirmation therefore accepts only events relayed by the owner's phone.
     jeeb_auto_confirm_enabled: bool = False
     jeeb_relay_secret: SecretStr = SecretStr("")
+    jeeb_relay_device_id: str = ""
+    jeeb_relay_tolerance_seconds: int = 300
+    jeeb_event_max_age_hours: int = 24
+    jeeb_intent_ttl_minutes: int = 30
 
     order_worker_interval_seconds: float = 5.0
     order_max_retries: int = 3
@@ -74,16 +78,14 @@ class Settings(BaseSettings):
     def strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
 
-    @field_validator("admin_ids", mode="after")
-    @classmethod
-    def always_include_owner(cls, value: list[int]) -> list[int]:
-        """Keep the store owner authorized even if a hosting panel overrides ADMIN_IDS."""
-        return sorted(set(value) | {8884716304})
-
     @model_validator(mode="after")
     def validate_enabled_integrations(self) -> Settings:
         if self.supplier_enabled and not self.supplier_api_key.get_secret_value():
             raise ValueError("SUPPLIER_API_KEY is required when SUPPLIER_ENABLED=true")
+        if self.supplier_enabled and not self.supplier_base_url.startswith("https://"):
+            raise ValueError(
+                "SUPPLIER_BASE_URL must be an HTTPS URL when SUPPLIER_ENABLED=true"
+            )
         if self.binance_pay_enabled:
             if not self.binance_pay_api_key.get_secret_value():
                 raise ValueError("BINANCE_PAY_API_KEY is required when Binance Pay is enabled")
@@ -94,6 +96,19 @@ class Settings(BaseSettings):
                 "JEEB_RELAY_SECRET must have at least 32 characters "
                 "when Jeeb auto confirm is enabled"
             )
+        if self.jeeb_auto_confirm_enabled:
+            if not self.jeeb_relay_device_id:
+                raise ValueError(
+                    "JEEB_RELAY_DEVICE_ID is required when Jeeb auto confirm is enabled"
+                )
+            if not 60 <= self.jeeb_relay_tolerance_seconds <= 900:
+                raise ValueError(
+                    "JEEB_RELAY_TOLERANCE_SECONDS must be between 60 and 900"
+                )
+            if not 1 <= self.jeeb_event_max_age_hours <= 168:
+                raise ValueError("JEEB_EVENT_MAX_AGE_HOURS must be between 1 and 168")
+            if not 10 <= self.jeeb_intent_ttl_minutes <= 120:
+                raise ValueError("JEEB_INTENT_TTL_MINUTES must be between 10 and 120")
         if self.app_env == "production":
             if not self.bot_token.get_secret_value():
                 raise ValueError("BOT_TOKEN is required in production")
