@@ -23,6 +23,7 @@ from app.keyboards import (
     categories_keyboard,
     confirm_buy_keyboard,
     delivery_keyboard,
+    jeeb_pending_keyboard,
     main_menu,
     payment_channels_keyboard,
     product_keyboard,
@@ -30,7 +31,7 @@ from app.keyboards import (
     referral_keyboard,
     user_account_keyboard,
 )
-from app.models import LedgerEntry, Order, PaymentChannel, SupplierCatalogItem, User, Wallet
+from app.models import LedgerEntry, Order, Payment, PaymentChannel, SupplierCatalogItem, User, Wallet
 from app.services.catalog import (
     active_categories,
     active_products,
@@ -589,6 +590,16 @@ def build_user_router(
             rate=format(quote.rate, "f"),
         )
 
+        if channel.code == "jeeb" and settings.jeeb_auto_confirm_enabled:
+            await state.set_state(DepositFlow.payer_account)
+            await message.answer(
+                "أرسل الآن رقم حساب/هاتف جيب الذي <b>ستحوّل منه</b>.\n\n"
+                "بعد تسجيله سيعطيك البوت مبلغًا دقيقًا ومميزًا للتحويل. "
+                "لا ترسل كلمة المرور أو رمز التأكيد مطلقًا.",
+                reply_markup=cancel_keyboard(),
+            )
+            return
+
         if channel.kind is PaymentKind.BINANCE_PAY:
             if binance is None:
                 await state.clear()
@@ -696,14 +707,24 @@ def build_user_router(
             rate=Decimal(data["rate"]),
         )
         try:
-            payment, mutation = await payment_service.create_jeeb_pending(
-                session,
-                user_id=message.from_user.id,
-                channel=channel,
-                quote=quote,
-                transaction_id=data["payer_reference"],
-                payer_account=message.text,
-            )
+            if data.get("payer_reference"):
+                payment, mutation = await payment_service.create_jeeb_pending(
+                    session,
+                    user_id=message.from_user.id,
+                    channel=channel,
+                    quote=quote,
+                    transaction_id=data["payer_reference"],
+                    payer_account=message.text,
+                )
+            else:
+                payment = await payment_service.create_jeeb_intent(
+                    session,
+                    user_id=message.from_user.id,
+                    channel=channel,
+                    quote=quote,
+                    payer_account=message.text,
+                )
+                mutation = None
         except PaymentError as exc:
             await message.answer(str(exc), reply_markup=cancel_keyboard())
             return
@@ -730,11 +751,109 @@ def build_user_router(
                 except Exception:
                     pass
             return
+        if not data.get("payer_reference"):
+            await message.answer(
+                f"✅ تم إنشاء طلب جيب <code>{payment.public_code}</code>\n\n"
+                f"حوّل الآن <b>بالضبط دون تقريب</b>:\n"
+                f"<b>{money_label(payment.expected_amount, payment.settlement_currency)}</b>\n"
+                f"إلى: <b>{html.escape(channel.account_label)}</b>\n\n"
+                f"سيضاف لرصيدك: <b>{money_label(payment.credit_amount)}</b>\n"
+                f"صلاحية المبلغ المميز: <b>{settings.jeeb_intent_ttl_minutes} دقيقة</b>.\n\n"
+                "سيصل الرصيد تلقائيًا بعد إشعار التحويل الوارد الموقّع من هاتف المتجر. "
+                "لا ترسل رقم العملية ولا تعِد الدفع مرتين.",
+                reply_markup=jeeb_pending_keyboard(payment.public_code),
+            )
+            return
         await message.answer(
             f"⏳ تم تسجيل طلب جيب <code>{payment.public_code}</code>.\n"
             "بانتظار إشعار التحويل الموثوق من محفظة المالك؛ "
             "سيضاف الرصيد تلقائيًا بعد المطابقة، ولن يُضاف مرتين."
         )
+
+    @router.callback_query(F.data.startswith("jeebproof:"))
+    async def request_jeeb_manual_review(
+        callback: CallbackQuery,
+        session: AsyncSession,
+        state: FSMContext,
+    ) -> None:
+        if callback.from_user is None:
+            return
+        public_code = callback.data.split(":", 1)[1]
+        payment = await session.scalar(
+            select(Payment).where(
+                Payment.public_code == public_code,
+                Payment.user_id == callback.from_user.id,
+                Payment.channel_code == "jeeb",
+            )
+        )
+        if payment is None:
+            await callback.answer("طلب الشحن غير موجود", show_alert=True)
+            return
+        if payment.status is PaymentStatus.CONFIRMED:
+            await callback.answer("تم تأكيد هذا الشحن بالفعل", show_alert=True)
+            return
+        if payment.status not in {PaymentStatus.PENDING, PaymentStatus.REVIEW_REQUIRED}:
+            await callback.answer("لا يمكن رفع إثبات لهذا الطلب", show_alert=True)
+            return
+        await state.set_state(DepositFlow.jeeb_proof)
+        await state.set_data({"jeeb_payment_id": str(payment.id)})
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                f"أرسل صورة إيصال جيب للطلب <code>{payment.public_code}</code>.\n"
+                "سيتم تحويله للمراجعة اليدوية ولن يضاف الرصيد تلقائيًا من الصورة.",
+                reply_markup=cancel_keyboard(),
+            )
+
+    @router.message(DepositFlow.jeeb_proof, F.photo)
+    async def receive_jeeb_manual_proof(
+        message: Message,
+        session: AsyncSession,
+        state: FSMContext,
+        bot: Bot,
+    ) -> None:
+        data = await state.get_data()
+        try:
+            payment_id = uuid.UUID(data["jeeb_payment_id"])
+        except (KeyError, ValueError):
+            await state.clear()
+            await message.answer("انتهت جلسة الإثبات؛ افتح طلب الشحن من جديد.")
+            return
+        payment = await session.get(Payment, payment_id)
+        if (
+            payment is None
+            or message.from_user is None
+            or payment.user_id != message.from_user.id
+            or payment.channel_code != "jeeb"
+            or payment.status not in {PaymentStatus.PENDING, PaymentStatus.REVIEW_REQUIRED}
+        ):
+            await state.clear()
+            await message.answer("طلب الشحن غير صالح للمراجعة.")
+            return
+        payment.proof_file_id = message.photo[-1].file_id
+        payment.status = PaymentStatus.REVIEW_REQUIRED
+        await session.commit()
+        await state.clear()
+        await message.answer(
+            f"✅ تم إرسال إثبات <code>{payment.public_code}</code> للمراجعة.\n"
+            "لا تحوّل المبلغ مرة أخرى."
+        )
+        caption = (
+            f"⚠️ إثبات جيب للمراجعة {payment.public_code}\n"
+            f"المستخدم: {payment.user_id}\n"
+            f"المبلغ المطلوب: "
+            f"{money_label(payment.expected_amount, payment.settlement_currency)}\n"
+            f"الرصيد: {money_label(payment.credit_amount)}"
+        )
+        for admin_id in settings.admin_ids:
+            try:
+                await bot.send_photo(admin_id, payment.proof_file_id, caption=caption)
+            except Exception:
+                pass
+
+    @router.message(DepositFlow.jeeb_proof)
+    async def jeeb_proof_must_be_photo(message: Message) -> None:
+        await message.answer("أرسل الإثبات كصورة، أو اضغط إلغاء.")
 
     @router.message(DepositFlow.proof, F.photo)
     async def deposit_proof(

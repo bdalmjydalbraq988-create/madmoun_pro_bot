@@ -332,6 +332,19 @@ class JeebPaymentIntent(TimestampMixin, Base):
     payer_account: Mapped[str] = mapped_column(String(40))
 
 
+class JeebAmountReservation(TimestampMixin, Base):
+    """Short-lived exact-amount lock that prevents ambiguous concurrent intents."""
+
+    __tablename__ = "jeeb_amount_reservations"
+
+    reservation_key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("payments.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class JeebTransactionEvent(TimestampMixin, Base):
     """One immutable transfer notification relayed from the wallet owner's phone."""
 
@@ -346,6 +359,17 @@ class JeebTransactionEvent(TimestampMixin, Base):
         ForeignKey("payments.id", ondelete="SET NULL"),
         unique=True,
     )
+
+
+class JeebRelayReceipt(TimestampMixin, Base):
+    """Authentication receipt; a nonce may represent only one immutable payload."""
+
+    __tablename__ = "jeeb_relay_receipts"
+
+    nonce: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source_device_id: Mapped[str] = mapped_column(String(64), index=True)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    transaction_id: Mapped[str] = mapped_column(String(200), index=True)
 
 
 class AuditLog(Base):

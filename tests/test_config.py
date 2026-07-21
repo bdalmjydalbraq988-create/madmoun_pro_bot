@@ -1,3 +1,4 @@
+import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
@@ -5,13 +6,13 @@ from app.config import Settings
 
 def test_admin_ids_are_parsed_from_csv() -> None:
     settings = Settings(admin_ids="1, 2,3")
-    assert settings.admin_ids == [1, 2, 3, 8884716304]
+    assert settings.admin_ids == [1, 2, 3]
 
 
 def test_admin_ids_are_parsed_from_environment_json_list(monkeypatch) -> None:
     monkeypatch.setenv("ADMIN_IDS", "[123]")
     settings = Settings()
-    assert settings.admin_ids == [123, 8884716304]
+    assert settings.admin_ids == [123]
 
 
 def test_enabled_binance_requires_merchant_secrets() -> None:
@@ -30,3 +31,9 @@ def test_enabled_jeeb_relay_requires_long_secret() -> None:
         assert "JEEB_RELAY_SECRET" in str(exc)
     else:
         raise AssertionError("Expected validation error")
+
+
+def test_enabled_jeeb_relay_requires_device_identity() -> None:
+    with pytest.raises(ValidationError) as exc:
+        Settings(jeeb_auto_confirm_enabled=True, jeeb_relay_secret="x" * 48)
+    assert "JEEB_RELAY_DEVICE_ID" in str(exc.value)

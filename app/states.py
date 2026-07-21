@@ -11,6 +11,7 @@ class DepositFlow(StatesGroup):
     reference = State()
     payer_account = State()
     proof = State()
+    jeeb_proof = State()
 
 
 class AdminPriceFlow(StatesGroup):
