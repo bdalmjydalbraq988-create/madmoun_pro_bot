@@ -21,6 +21,7 @@ from app.services.providers.base import (
     ProvisionRequest,
     SupplierProvider,
 )
+from app.services.referrals import ReferralService
 from app.services.wallet import InsufficientBalance, WalletService, money
 
 logger = logging.getLogger(__name__)
@@ -35,9 +36,15 @@ def order_code() -> str:
 
 
 class OrderService:
-    def __init__(self, cipher: PayloadCipher, wallet: WalletService | None = None) -> None:
+    def __init__(
+        self,
+        cipher: PayloadCipher,
+        wallet: WalletService | None = None,
+        referrals: ReferralService | None = None,
+    ) -> None:
         self.cipher = cipher
         self.wallet = wallet or WalletService()
+        self.referrals = referrals or ReferralService(self.wallet)
 
     async def place_order(
         self,
@@ -156,6 +163,7 @@ class OrderService:
         order.delivery_encrypted = self.cipher.encrypt(delivery)
         order.status = OrderStatus.COMPLETED
         order.completed_at = datetime.now(UTC)
+        await self.referrals.award_completed_order(session, order=order)
         add_audit(
             session,
             actor_user_id=admin_id,
@@ -289,6 +297,10 @@ class OrderProcessor:
                     order.delivery_encrypted = self.order_service.cipher.encrypt(result.delivery)
                     order.status = OrderStatus.COMPLETED
                     order.completed_at = datetime.now(UTC)
+                    await self.order_service.referrals.award_completed_order(
+                        session,
+                        order=order,
+                    )
                     message = "completed"
                 else:
                     order.status = OrderStatus.PROVIDER_PENDING
