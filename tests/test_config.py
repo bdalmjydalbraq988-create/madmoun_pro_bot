@@ -21,3 +21,12 @@ def test_enabled_binance_requires_merchant_secrets() -> None:
         assert "BINANCE_PAY_API_KEY" in str(exc)
     else:
         raise AssertionError("Expected validation error")
+
+
+def test_enabled_jeeb_relay_requires_long_secret() -> None:
+    try:
+        Settings(jeeb_auto_confirm_enabled=True, jeeb_relay_secret="short")
+    except ValidationError as exc:
+        assert "JEEB_RELAY_SECRET" in str(exc)
+    else:
+        raise AssertionError("Expected validation error")
