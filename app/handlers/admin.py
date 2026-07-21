@@ -10,19 +10,24 @@ from aiogram.filters import Command, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, TelegramObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import __version__
 from app.config import Settings
 from app.crypto import PayloadCipher
 from app.enums import FulfillmentMode, LedgerKind, OrderStatus, PaymentStatus
+from app.formatting import decimal_number, money_label
 from app.keyboards import (
     admin_channel_keyboard,
     admin_dashboard_keyboard,
     admin_order_keyboard,
     admin_payment_keyboard,
     admin_product_keyboard,
+    admin_referral_keyboard,
     admin_supplier_keyboard,
+    admin_user_keyboard,
+    admin_user_orders_keyboard,
     cancel_keyboard,
 )
 from app.models import (
@@ -31,6 +36,7 @@ from app.models import (
     Payment,
     PaymentChannel,
     Product,
+    Referral,
     SupplierCatalogItem,
     User,
     Wallet,
@@ -43,6 +49,7 @@ from app.services.supplier_catalog import (
     calculate_sale_price,
     catalog_item_for_product,
     get_sync_config,
+    repair_supplier_catalog_visibility,
     reprice_unlocked_products,
     sync_supplier_catalog,
 )
@@ -57,9 +64,11 @@ from app.states import (
     AdminPriceFlow,
     AdminProductEditFlow,
     AdminProductFlow,
+    AdminReferralConfigFlow,
     AdminRefundFlow,
     AdminSupplierMarkupFlow,
     AdminSupplierMinimumProfitFlow,
+    AdminUserLookupFlow,
     AdminWalletFlow,
 )
 
@@ -71,6 +80,18 @@ class IsAdmin(Filter):
     async def __call__(self, event: TelegramObject) -> bool:
         user = getattr(event, "from_user", None)
         return bool(user and user.id in self.admin_ids)
+
+
+ADMIN_ORDER_STATUS_AR = {
+    OrderStatus.QUEUED: "قيد التنفيذ",
+    OrderStatus.PROCESSING: "قيد التنفيذ",
+    OrderStatus.PROVIDER_PENDING: "قيد التنفيذ لدى المورد",
+    OrderStatus.REVIEW_REQUIRED: "تحت المراجعة",
+    OrderStatus.COMPLETED: "مكتمل",
+    OrderStatus.FAILED: "فشل",
+    OrderStatus.REFUNDED: "تم رد الرصيد",
+    OrderStatus.CANCELED: "ملغي",
+}
 
 
 def build_admin_router(
@@ -100,7 +121,11 @@ def build_admin_router(
             await session.scalar(
                 select(func.count())
                 .select_from(Payment)
-                .where(Payment.status == PaymentStatus.PENDING)
+                .where(
+                    Payment.status.in_(
+                        [PaymentStatus.PENDING, PaymentStatus.REVIEW_REQUIRED]
+                    )
+                )
             )
             or 0
         )
@@ -111,7 +136,8 @@ def build_admin_router(
             f"إجمالي الطلبات: {orders}\n"
             f"طلبات تحتاج مراجعة: {review_orders}\n"
             f"شحنات معلقة: {pending_payments}\n"
-            f"مجموع أرصدة العملاء: {Decimal(total_balances):g} USDT"
+            f"مجموع أرصدة العملاء: {money_label(Decimal(total_balances))}\n\n"
+            f"إصدار البوت: <code>{__version__}</code>"
         )
 
     @router.message(Command("admin"))
@@ -127,6 +153,321 @@ def build_admin_router(
             await callback.message.edit_text(
                 await dashboard_text(session), reply_markup=admin_dashboard_keyboard()
             )
+
+    async def referral_panel_text(session: AsyncSession) -> tuple[str, bool]:
+        config = await order_service.referrals.get_config(session)
+        registered = await session.scalar(select(func.count()).select_from(Referral)) or 0
+        rewarded = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Referral)
+                .where(Referral.rewarded_at.is_not(None))
+            )
+            or 0
+        )
+        paid = await session.scalar(
+            select(
+                func.coalesce(
+                    func.sum(
+                        Referral.referrer_reward_amount + Referral.invitee_reward_amount
+                    ),
+                    0,
+                )
+            ).where(Referral.rewarded_at.is_not(None))
+        )
+        text = (
+            "🎁 <b>نظام الإحالة</b>\n\n"
+            f"الحالة: {'✅ يعمل' if config.enabled else '⏸ متوقف'}\n"
+            f"الإحالات المسجلة: {registered}\n"
+            f"الإحالات المكافأة: {rewarded}\n"
+            f"إجمالي المكافآت المصروفة: {money_label(paid or 0)}\n\n"
+            f"مكافأة الداعي: <b>{money_label(config.referrer_reward)}</b>\n"
+            f"هدية المدعو: <b>{money_label(config.invitee_reward)}</b>\n"
+            f"الحد الأدنى لأول طلب: <b>{money_label(config.minimum_order_amount)}</b>\n\n"
+            "الحماية: عميل جديد فقط، لا إحالة ذاتية، لا تغيير للداعي، "
+            "والصرف مرة واحدة بعد أول طلب مكتمل."
+        )
+        return text, config.enabled
+
+    @router.callback_query(F.data == "adm:referrals")
+    async def referral_panel(callback: CallbackQuery, session: AsyncSession) -> None:
+        text, enabled = await referral_panel_text(session)
+        await callback.answer()
+        if callback.message:
+            await callback.message.edit_text(
+                text,
+                reply_markup=admin_referral_keyboard(enabled),
+            )
+
+    @router.callback_query(F.data == "adm:referrals:toggle")
+    async def toggle_referrals(callback: CallbackQuery, session: AsyncSession) -> None:
+        config = await order_service.referrals.get_config(session)
+        if not config.enabled and money(config.referrer_reward) <= 0 and money(
+            config.invitee_reward
+        ) <= 0:
+            await callback.answer(
+                "اضبط مكافأة الداعي أو المدعو أولًا، ثم شغّل النظام.",
+                show_alert=True,
+            )
+            return
+        config.enabled = not config.enabled
+        add_audit(
+            session,
+            actor_user_id=callback.from_user.id,
+            action="referral.config_toggled",
+            entity_type="referral_config",
+            entity_id="default",
+            metadata={"enabled": config.enabled},
+        )
+        text, enabled = await referral_panel_text(session)
+        await callback.answer("تم تحديث حالة نظام الإحالة")
+        if callback.message:
+            await callback.message.edit_text(
+                text,
+                reply_markup=admin_referral_keyboard(enabled),
+            )
+
+    @router.callback_query(F.data.startswith("adm:referrals:set:"))
+    async def begin_referral_config(callback: CallbackQuery, state: FSMContext) -> None:
+        field = callback.data.rsplit(":", 1)[-1]
+        prompts = {
+            "referrer": "أرسل مكافأة الداعي بوحدة USDT (مثال 0.25):",
+            "invitee": "أرسل هدية العميل المدعو بوحدة USDT (مثال 0.10):",
+            "minimum": "أرسل أقل قيمة لأول طلب مؤهل بوحدة USDT (مثال 1):",
+        }
+        if field not in prompts:
+            await callback.answer("إعداد غير صالح", show_alert=True)
+            return
+        await state.set_state(AdminReferralConfigFlow.value)
+        await state.set_data({"referral_field": field})
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(prompts[field], reply_markup=cancel_keyboard())
+
+    @router.message(AdminReferralConfigFlow.value, F.text)
+    async def save_referral_config(
+        message: Message,
+        session: AsyncSession,
+        state: FSMContext,
+    ) -> None:
+        try:
+            value = money(Decimal(message.text.replace(",", ".").strip()))
+        except (InvalidOperation, ValueError):
+            await message.answer("أرسل رقمًا صحيحًا، مثل 0.25")
+            return
+        if value < 0 or value > Decimal("1000"):
+            await message.answer("القيمة يجب أن تكون بين 0 و1000 USDT.")
+            return
+        data = await state.get_data()
+        field = data.get("referral_field")
+        config = await order_service.referrals.get_config(session)
+        if field == "referrer":
+            config.referrer_reward = value
+        elif field == "invitee":
+            config.invitee_reward = value
+        elif field == "minimum":
+            config.minimum_order_amount = value
+        else:
+            await state.clear()
+            await message.answer("انتهت جلسة الإعداد؛ افتح نظام الإحالة مجددًا.")
+            return
+        add_audit(
+            session,
+            actor_user_id=message.from_user.id,
+            action="referral.config_updated",
+            entity_type="referral_config",
+            entity_id="default",
+            metadata={"field": field, "value": format(value, "f")},
+        )
+        await state.clear()
+        text, enabled = await referral_panel_text(session)
+        await message.answer(
+            "✅ تم حفظ الإعداد.\n\n" + text,
+            reply_markup=admin_referral_keyboard(enabled),
+        )
+
+    async def user_card_text(session: AsyncSession, user_id: int) -> str | None:
+        user = await session.get(User, user_id)
+        if user is None:
+            return None
+        wallet = await session.get(Wallet, user_id)
+        orders_count = (
+            await session.scalar(
+                select(func.count()).select_from(Order).where(Order.user_id == user_id)
+            )
+            or 0
+        )
+        completed_count = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Order)
+                .where(
+                    Order.user_id == user_id,
+                    Order.status == OrderStatus.COMPLETED,
+                )
+            )
+            or 0
+        )
+        referral = await session.get(Referral, user_id)
+        referral_stats = await order_service.referrals.stats(session, user_id)
+        username = f"@{html.escape(user.username)}" if user.username else "غير محدد"
+        registered = user.created_at.strftime("%Y-%m-%d %H:%M")
+        return (
+            "👤 <b>بيانات المشترك</b>\n\n"
+            f"الاسم: {html.escape(user.display_name or '-')}\n"
+            f"المعرف: {username}\n"
+            f"Telegram ID: <code>{user.telegram_id}</code>\n"
+            f"الرصيد: <b>{money_label(wallet.balance if wallet is not None else 0)}</b>\n"
+            f"الطلبات: {orders_count}\n"
+            f"المكتملة: {completed_count}\n"
+            f"دعاه العميل: "
+            f"{f'<code>{referral.referrer_id}</code>' if referral else 'رابط مباشر'}\n"
+            f"دعواته: {referral_stats.invited} — "
+            f"مكافآته: {money_label(referral_stats.earned)}\n"
+            f"تاريخ التسجيل: {registered} UTC"
+        )
+
+    @router.callback_query(F.data == "adm:users")
+    async def subscribers_list(callback: CallbackQuery, session: AsyncSession) -> None:
+        total = await session.scalar(select(func.count()).select_from(User)) or 0
+        rows = (
+            await session.execute(
+                select(User, Wallet)
+                .join(Wallet, Wallet.user_id == User.telegram_id, isouter=True)
+                .order_by(User.created_at.desc())
+                .limit(15)
+            )
+        ).all()
+        builder = InlineKeyboardBuilder()
+        for user, wallet in rows:
+            name = (user.display_name or user.username or str(user.telegram_id))[:22]
+            builder.button(
+                text=f"👤 {name} | {money_label(wallet.balance if wallet else 0)}",
+                callback_data=f"adm:user:{user.telegram_id}",
+            )
+        builder.button(text="🔎 بحث بالمعرف", callback_data="adm:usersearch")
+        builder.button(text="↩️ لوحة الإدارة", callback_data="adm:dashboard")
+        builder.adjust(1)
+        await callback.answer()
+        if callback.message:
+            await callback.message.edit_text(
+                f"👥 <b>المشتركون</b>\n\nالإجمالي: {total}\nآخر 15 مشتركًا:",
+                reply_markup=builder.as_markup(),
+            )
+
+    @router.callback_query(F.data.startswith("adm:user:"))
+    async def subscriber_detail(callback: CallbackQuery, session: AsyncSession) -> None:
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer("معرف غير صالح", show_alert=True)
+            return
+        text = await user_card_text(session, user_id)
+        if text is None:
+            await callback.answer("المستخدم غير موجود", show_alert=True)
+            return
+        await callback.answer()
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=admin_user_keyboard(user_id))
+
+    @router.callback_query(F.data.startswith("adm:userorders:"))
+    async def subscriber_orders(callback: CallbackQuery, session: AsyncSession) -> None:
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer("معرف غير صالح", show_alert=True)
+            return
+        user = await session.get(User, user_id)
+        if user is None:
+            await callback.answer("المستخدم غير موجود", show_alert=True)
+            return
+        orders = list(
+            await session.scalars(
+                select(Order)
+                .where(Order.user_id == user_id)
+                .order_by(Order.created_at.desc())
+                .limit(10)
+            )
+        )
+        title_name = html.escape(user.display_name or user.username or str(user.telegram_id))
+        lines = [
+            f"📦 <b>آخر طلبات {title_name}</b>",
+            f"رقم العميل: <code>{user.telegram_id}</code>",
+        ]
+        if not orders:
+            lines.append("\nلا توجد طلبات لهذا العميل حتى الآن.")
+        else:
+            for order in orders:
+                status = ADMIN_ORDER_STATUS_AR.get(order.status, order.status.value)
+                created = order.created_at.strftime("%Y-%m-%d %H:%M")
+                lines.append(
+                    "\n"
+                    f"<code>{order.public_code}</code> — "
+                    f"{html.escape(order.product_name_snapshot)}\n"
+                    f"{status} • {money_label(order.total_amount, order.currency)} • "
+                    f"{created} UTC"
+                )
+        await callback.answer()
+        if callback.message:
+            await callback.message.edit_text(
+                "\n".join(lines),
+                reply_markup=admin_user_orders_keyboard(user_id),
+            )
+
+    async def begin_user_search(target: Message | CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(AdminUserLookupFlow.user_id)
+        if isinstance(target, CallbackQuery):
+            await target.answer()
+            if target.message:
+                await target.message.answer(
+                    "أرسل Telegram ID للمشترك:", reply_markup=cancel_keyboard()
+                )
+        else:
+            await target.answer("أرسل Telegram ID للمشترك:", reply_markup=cancel_keyboard())
+
+    @router.callback_query(F.data == "adm:usersearch")
+    async def user_search_button(callback: CallbackQuery, state: FSMContext) -> None:
+        await begin_user_search(callback, state)
+
+    @router.message(Command("user"))
+    async def user_search_command(
+        message: Message,
+        session: AsyncSession,
+        state: FSMContext,
+    ) -> None:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) == 1:
+            await begin_user_search(message, state)
+            return
+        try:
+            user_id = int(parts[1].strip())
+        except ValueError:
+            await message.answer("الاستخدام الصحيح: <code>/user 123456789</code>")
+            return
+        text = await user_card_text(session, user_id)
+        if text is None:
+            await message.answer("المستخدم غير موجود؛ يجب أن يرسل /start للبوت أولًا.")
+            return
+        await state.clear()
+        await message.answer(text, reply_markup=admin_user_keyboard(user_id))
+
+    @router.message(AdminUserLookupFlow.user_id, F.text)
+    async def user_search_result(
+        message: Message,
+        session: AsyncSession,
+        state: FSMContext,
+    ) -> None:
+        try:
+            user_id = int(message.text.strip())
+        except ValueError:
+            await message.answer("أرسل رقم Telegram ID صحيحًا.")
+            return
+        text = await user_card_text(session, user_id)
+        if text is None:
+            await message.answer("المستخدم غير موجود؛ يجب أن يرسل /start للبوت أولًا.")
+            return
+        await state.clear()
+        await message.answer(text, reply_markup=admin_user_keyboard(user_id))
 
     def supplier_client() -> VenteBotProvider | None:
         api_key = settings.supplier_api_key.get_secret_value()
@@ -164,6 +505,20 @@ def build_admin_router(
             )
             or 0
         )
+        available = (
+            await session.scalar(
+                select(func.count())
+                .select_from(SupplierCatalogItem)
+                .where(
+                    SupplierCatalogItem.provider_code == "ventebot",
+                    or_(
+                        SupplierCatalogItem.stock.is_(None),
+                        SupplierCatalogItem.stock > 0,
+                    ),
+                )
+            )
+            or 0
+        )
         locked = (
             await session.scalar(
                 select(func.count())
@@ -185,15 +540,88 @@ def build_admin_router(
             "🔌 <b>المورد والمزامنة</b>\n\n"
             f"حالة الربط: {'✅ جاهز' if enabled else '⚠️ غير مهيأ'}\n"
             f"الخدمات المربوطة: {linked}\n"
+            f"المتاحة لدى المورد: {available}\n"
             f"الخدمات المفعلة: {active}\n"
             f"أسعار يدوية محمية: {locked}\n"
-            f"نسبة الربح: {config.markup_percent:g}%\n"
-            f"أقل ربح للخدمة: {config.minimum_profit:g} USDT\n"
+            f"نسبة الربح: {decimal_number(config.markup_percent)}%\n"
+            f"أقل ربح للخدمة: {money_label(config.minimum_profit)}\n"
             f"التفعيل بعد الجلب: {'تلقائي' if config.auto_activate else 'معطل للمراجعة'}\n"
             f"آخر مزامنة: {last_sync}\n"
             f"نتيجة آخر مزامنة: {html.escape(config.last_sync_status)}\n"
             f"التفاصيل: {html.escape(config.last_sync_message or '-')}"
+            + (
+                "\n\n⚠️ الخدمات متاحة لكنها مخفية؛ اضغط «إصلاح وإظهار الخدمات المتاحة»."
+                if available and not active
+                else ""
+            )
         )
+
+    async def run_catalog_repair(
+        session: AsyncSession,
+        *,
+        actor_user_id: int,
+    ):
+        sync_error: str | None = None
+        provider = supplier_client()
+        if provider is not None:
+            try:
+                await sync_supplier_catalog(
+                    session,
+                    provider=provider,
+                    actor_user_id=actor_user_id,
+                )
+            except Exception as exc:
+                # Existing safe snapshots are still enough to restore visibility.
+                sync_error = str(exc)[:250]
+            finally:
+                await provider.close()
+        repair = await repair_supplier_catalog_visibility(
+            session,
+            actor_user_id=actor_user_id,
+        )
+        return repair, sync_error
+
+    def catalog_repair_text(repair, sync_error: str | None) -> str:
+        warning = (
+            f"\n⚠️ تعذر التحديث اللحظي، فاستُخدمت آخر نسخة آمنة: "
+            f"<code>{html.escape(sync_error)}</code>"
+            if sync_error
+            else ""
+        )
+        return (
+            "✅ <b>تم إصلاح الكتالوج</b>\n\n"
+            f"الخدمات المربوطة: {repair.linked}\n"
+            f"الخدمات المتاحة والظاهرة: {repair.active}\n"
+            f"خدمات أُعيد إظهارها الآن: {repair.activated}\n"
+            f"خدمات غير متاحة لدى المورد: {repair.unavailable}\n"
+            f"أقسام أُعيد تفعيلها: {repair.categories_reactivated}\n\n"
+            "لم تتغير أسعارك اليدوية أو الطلبات أو أرصدة العملاء."
+            f"{warning}"
+        )
+
+    @router.message(Command("repair_catalog"))
+    async def repair_catalog_command(message: Message, session: AsyncSession) -> None:
+        progress = await message.answer("⏳ أفحص المورد وأصلح ظهور الخدمات…")
+        repair, sync_error = await run_catalog_repair(
+            session,
+            actor_user_id=message.from_user.id,
+        )
+        await progress.edit_text(catalog_repair_text(repair, sync_error))
+
+    @router.callback_query(F.data == "adm:supplier:repair")
+    async def repair_catalog_callback(callback: CallbackQuery, session: AsyncSession) -> None:
+        await callback.answer("جاري إصلاح الكتالوج…")
+        if callback.message:
+            await callback.message.edit_text("⏳ أفحص المورد وأصلح ظهور الخدمات…")
+        repair, sync_error = await run_catalog_repair(
+            session,
+            actor_user_id=callback.from_user.id,
+        )
+        if callback.message:
+            await callback.message.edit_text(
+                catalog_repair_text(repair, sync_error),
+                reply_markup=admin_supplier_keyboard(auto_activate=True),
+            )
 
     @router.callback_query(F.data == "adm:supplier")
     async def supplier_panel(callback: CallbackQuery, session: AsyncSession) -> None:
@@ -241,7 +669,7 @@ def build_admin_router(
         if callback.message:
             await callback.message.edit_text(
                 "✅ <b>اكتملت مزامنة المورد</b>\n\n"
-                f"رصيد المورد: {balance:g} USDT\n"
+                f"رصيد المورد: {money_label(balance)}\n"
                 f"وصل من المورد: {result.received}\n"
                 f"خدمات جديدة: {result.created}\n"
                 f"خدمات محدثة: {result.updated}\n"
@@ -285,7 +713,7 @@ def build_admin_router(
         )
         await state.clear()
         await message.answer(
-            f"✅ نسبة الربح الآن {value:g}%، وأُعيد تسعير {changed} خدمة غير مقفلة."
+            f"✅ نسبة الربح الآن {decimal_number(value)}%، وأُعيد تسعير {changed} خدمة غير مقفلة."
         )
 
     @router.callback_query(F.data == "adm:supplier:minprofit")
@@ -322,12 +750,19 @@ def build_admin_router(
             metadata={"minimum_profit": format(value, "f"), "repriced": changed},
         )
         await state.clear()
-        await message.answer(f"✅ أقل ربح الآن {value:g} USDT، وأُعيد تسعير {changed} خدمة.")
+        await message.answer(f"✅ أقل ربح الآن {money_label(value)}، وأُعيد تسعير {changed} خدمة.")
 
     @router.callback_query(F.data == "adm:supplier:autoactivate")
     async def toggle_supplier_auto_activate(callback: CallbackQuery, session: AsyncSession) -> None:
         config = await get_sync_config(session)
         config.auto_activate = not config.auto_activate
+        activated = 0
+        if config.auto_activate:
+            repair = await repair_supplier_catalog_visibility(
+                session,
+                actor_user_id=callback.from_user.id,
+            )
+            activated = repair.activated
         add_audit(
             session,
             actor_user_id=callback.from_user.id,
@@ -336,7 +771,11 @@ def build_admin_router(
             entity_id="ventebot",
             metadata={"auto_activate": config.auto_activate},
         )
-        await callback.answer("تم تحديث سياسة التفعيل")
+        await callback.answer(
+            f"تم تشغيل التفعيل وإظهار {activated} خدمة"
+            if config.auto_activate
+            else "تم إيقاف التفعيل التلقائي؛ الخدمات الحالية ستبقى ظاهرة"
+        )
         if callback.message:
             await callback.message.edit_text(
                 await supplier_panel_text(session),
@@ -350,7 +789,8 @@ def build_admin_router(
         for product in products:
             mark = "🟢" if product.is_active else "⚫️"
             builder.button(
-                text=f"{mark} {product.name_ar} — {product.sale_price:g}",
+                text=f"{mark} {product.name_ar} — "
+                f"{money_label(product.sale_price, product.currency)}",
                 callback_data=f"adm:product:{product.id}",
             )
         builder.button(text="➕ إضافة خدمة", callback_data="adm:add_product")
@@ -380,10 +820,15 @@ def build_admin_router(
                 f"\nالتسعير: {'يدوي محمي' if snapshot.price_locked else 'تلقائي'}"
                 f"\nالتفعيل: {'يدوي محمي' if snapshot.activation_locked else 'تلقائي'}"
             )
+        cost_text = (
+            money_label(product.cost_price, product.currency)
+            if product.cost_price is not None
+            else "-"
+        )
         text = (
             f"<b>{html.escape(product.name_ar)}</b>\n"
-            f"السعر: {product.sale_price:g} {product.currency}\n"
-            f"التكلفة: {product.cost_price if product.cost_price is not None else '-'}\n"
+            f"السعر: {money_label(product.sale_price, product.currency)}\n"
+            f"التكلفة: {cost_text}\n"
             f"الحالة: {'مفعلة' if product.is_active else 'معطلة'}\n"
             f"التنفيذ: {product.fulfillment_mode.value}\n"
             f"معرّف المورد: <code>{html.escape(product.provider_product_id or '-')}</code>"
@@ -473,7 +918,7 @@ def build_admin_router(
             metadata={"old": format(old, "f"), "new": format(price, "f")},
         )
         await state.clear()
-        await message.answer(f"✅ أصبح سعر {html.escape(product.name_ar)}: {price:g} USDT")
+        await message.answer(f"✅ أصبح سعر {html.escape(product.name_ar)}: {money_label(price)}")
 
     @router.callback_query(F.data.startswith("adm:autoprice:"))
     async def restore_automatic_price(callback: CallbackQuery, session: AsyncSession) -> None:
@@ -500,7 +945,7 @@ def build_admin_router(
             entity_id=str(product.id),
             metadata={"sale_price": format(product.sale_price, "f")},
         )
-        await callback.answer(f"السعر التلقائي: {product.sale_price:g} USDT", show_alert=True)
+        await callback.answer(f"السعر التلقائي: {money_label(product.sale_price)}", show_alert=True)
 
     @router.callback_query(F.data.startswith("adm:autoactive:"))
     async def restore_automatic_activation(callback: CallbackQuery, session: AsyncSession) -> None:
@@ -825,6 +1270,33 @@ def build_admin_router(
                 "أرسل Telegram ID للعميل:", reply_markup=cancel_keyboard()
             )
 
+    @router.callback_query(F.data.startswith("adm:userwallet:"))
+    async def begin_selected_wallet_adjustment(
+        callback: CallbackQuery,
+        session: AsyncSession,
+        state: FSMContext,
+    ) -> None:
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer("معرف غير صالح", show_alert=True)
+            return
+        user = await session.get(User, user_id)
+        wallet = await session.get(Wallet, user_id)
+        if user is None or wallet is None:
+            await callback.answer("المستخدم غير موجود", show_alert=True)
+            return
+        await state.set_state(AdminWalletFlow.amount)
+        await state.set_data({"user_id": user_id})
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                f"المشترك: <code>{user_id}</code>\n"
+                f"الرصيد الحالي: <b>{money_label(wallet.balance)}</b>\n\n"
+                "أرسل المبلغ: موجب للإضافة، وسالب للخصم. مثال: 5 أو -2",
+                reply_markup=cancel_keyboard(),
+            )
+
     @router.message(AdminWalletFlow.user_id, F.text)
     async def wallet_user(message: Message, session: AsyncSession, state: FSMContext) -> None:
         try:
@@ -835,9 +1307,13 @@ def build_admin_router(
         if await session.get(User, user_id) is None:
             await message.answer("المستخدم غير موجود؛ يجب أن يرسل /start للبوت أولًا.")
             return
+        wallet = await session.get(Wallet, user_id)
         await state.update_data(user_id=user_id)
         await state.set_state(AdminWalletFlow.amount)
-        await message.answer("أرسل المبلغ: موجب للإضافة، وسالب للخصم. مثال: 5 أو -2")
+        await message.answer(
+            f"الرصيد الحالي: <b>{money_label(wallet.balance if wallet else 0)}</b>\n\n"
+            "أرسل المبلغ: موجب للإضافة، وسالب للخصم. مثال: 5 أو -2"
+        )
 
     @router.message(AdminWalletFlow.amount, F.text)
     async def wallet_amount(message: Message, state: FSMContext) -> None:
@@ -888,7 +1364,7 @@ def build_admin_router(
                     note=reason,
                 )
         except InsufficientBalance as exc:
-            await message.answer(f"الرصيد غير كافٍ؛ المتاح {exc.available:g} USDT")
+            await message.answer(f"الرصيد غير كافٍ؛ المتاح {money_label(exc.available)}")
             return
         add_audit(
             session,
@@ -899,7 +1375,7 @@ def build_admin_router(
             metadata={"amount": format(amount, "f"), "reason": reason[:300]},
         )
         await state.clear()
-        await message.answer(f"✅ تم التعديل. الرصيد الجديد: {result.balance_after:g} USDT")
+        await message.answer(f"✅ تم التعديل. الرصيد الجديد: {money_label(result.balance_after)}")
 
     @router.callback_query(F.data == "adm:payments")
     async def pending_payments(callback: CallbackQuery, session: AsyncSession) -> None:
@@ -907,7 +1383,9 @@ def build_admin_router(
             await session.scalars(
                 select(Payment)
                 .where(
-                    Payment.status == PaymentStatus.PENDING,
+                    Payment.status.in_(
+                        [PaymentStatus.PENDING, PaymentStatus.REVIEW_REQUIRED]
+                    ),
                     Payment.channel_code != "binance",
                 )
                 .order_by(Payment.created_at)
@@ -925,8 +1403,9 @@ def build_admin_router(
                 f"<b>{payment.public_code}</b>\n"
                 f"العميل: <code>{payment.user_id}</code>\n"
                 f"الطريقة: {payment.channel_code}\n"
-                f"المبلغ المحول: {payment.expected_amount:g} {payment.settlement_currency}\n"
-                f"الرصيد المطلوب: {payment.credit_amount:g} USDT\n"
+                f"المبلغ المحول: "
+                f"{money_label(payment.expected_amount, payment.settlement_currency)}\n"
+                f"الرصيد المطلوب: {money_label(payment.credit_amount)}\n"
                 f"المرجع: {html.escape(payment.payer_reference or '-')}"
             )
             if payment.proof_file_id:
@@ -957,7 +1436,7 @@ def build_admin_router(
         await bot.send_message(
             payment.user_id,
             f"✅ تم اعتماد الشحن <code>{payment.public_code}</code>.\n"
-            f"رصيدك الجديد: <b>{mutation.balance_after:g} USDT</b>",
+            f"رصيدك الجديد: <b>{money_label(mutation.balance_after)}</b>",
         )
 
     @router.callback_query(F.data.startswith("adm:payno:"))
@@ -1055,6 +1534,25 @@ def build_admin_router(
             f"✅ اكتمل طلبك <code>{order.public_code}</code>.\n"
             f"اعرض التسليم بالأمر /delivery_{order.public_code}",
         )
+        referral = await session.scalar(
+            select(Referral).where(
+                Referral.qualified_order_id == order.id,
+                Referral.rewarded_at.is_not(None),
+            )
+        )
+        if referral is not None:
+            if referral.invitee_reward_amount > 0:
+                await bot.send_message(
+                    referral.invitee_id,
+                    "🎉 أُضيفت هدية الإحالة إلى رصيدك: "
+                    f"<b>{money_label(referral.invitee_reward_amount)}</b>",
+                )
+            if referral.referrer_reward_amount > 0:
+                await bot.send_message(
+                    referral.referrer_id,
+                    "🎁 اكتملت أول عملية شراء لأحد المدعوين، وأُضيفت مكافأتك: "
+                    f"<b>{money_label(referral.referrer_reward_amount)}</b>",
+                )
 
     @router.callback_query(F.data.startswith("adm:refund:"))
     async def begin_refund(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1091,7 +1589,7 @@ def build_admin_router(
         await message.answer("✅ تم رد الرصيد.")
         await bot.send_message(
             order.user_id,
-            f"↩️ تم رد مبلغ {order.total_amount:g} USDT للطلب "
+            f"↩️ تم رد مبلغ {money_label(order.total_amount)} للطلب "
             f"<code>{order.public_code}</code>.\n"
             f"السبب: {html.escape(order.last_error_message or '')}",
         )
@@ -1125,8 +1623,9 @@ def build_admin_router(
         text = (
             f"<b>{channel.name_ar}</b>\n"
             f"الحالة: {'مفعلة' if channel.is_active else 'معطلة'}\n"
-            f"سعر الصرف: 1 USDT = {channel.units_per_usdt:g} {channel.settlement_currency}\n"
-            f"الرسوم: {channel.fee_percent:g}%\n"
+            f"سعر الصرف: 1 USDT = {decimal_number(channel.units_per_usdt)} "
+            f"{channel.settlement_currency}\n"
+            f"الرسوم: {decimal_number(channel.fee_percent)}%\n"
             f"الحساب: {html.escape(channel.account_label or '-')}\n\n"
             f"{html.escape(channel.instructions_ar)}"
         )
@@ -1206,7 +1705,9 @@ def build_admin_router(
             metadata={"old": format(old, "f"), "new": format(rate, "f")},
         )
         await state.clear()
-        await message.answer(f"✅ السعر الجديد: 1 USDT = {rate:g} {channel.settlement_currency}")
+        await message.answer(
+            f"✅ السعر الجديد: 1 USDT = {decimal_number(rate)} {channel.settlement_currency}"
+        )
 
     @router.callback_query(F.data.startswith("adm:chinfo:"))
     async def begin_channel_info(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1282,6 +1783,6 @@ def build_admin_router(
             metadata={"old": format(old, "f"), "new": format(fee, "f")},
         )
         await state.clear()
-        await message.answer(f"✅ أصبحت رسوم {channel.name_ar}: {fee:g}%")
+        await message.answer(f"✅ أصبحت رسوم {channel.name_ar}: {decimal_number(fee)}%")
 
     return router
