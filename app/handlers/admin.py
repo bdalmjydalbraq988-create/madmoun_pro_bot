@@ -4,6 +4,7 @@ import html
 import secrets
 import uuid
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, Filter
@@ -49,10 +50,13 @@ from app.services.supplier_catalog import (
     calculate_sale_price,
     catalog_item_for_product,
     get_sync_config,
-    repair_supplier_catalog_visibility,
     reprice_unlocked_products,
     sync_supplier_catalog,
 )
+try:
+    from app.services.supplier_catalog import repair_supplier_catalog_visibility as _native_repair
+except ImportError:  # Compatibility with partially synchronized hosting deployments.
+    _native_repair = None
 from app.services.wallet import InsufficientBalance, WalletService, money
 from app.states import (
     AdminCategoryFlow,
@@ -92,6 +96,77 @@ ADMIN_ORDER_STATUS_AR = {
     OrderStatus.REFUNDED: "تم رد الرصيد",
     OrderStatus.CANCELED: "ملغي",
 }
+
+
+async def _repair_supplier_catalog_visibility(
+    session: AsyncSession,
+    *,
+    actor_user_id: int | None,
+):
+    """Use the native repair, or a safe compatibility repair on mixed deployments."""
+
+    if _native_repair is not None:
+        return await _native_repair(session, actor_user_id=actor_user_id)
+
+    config = await get_sync_config(session)
+    config.auto_activate = True
+    snapshots = list(
+        await session.scalars(
+            select(SupplierCatalogItem).where(
+                SupplierCatalogItem.provider_code == "ventebot",
+                SupplierCatalogItem.product_id.is_not(None),
+            )
+        )
+    )
+    activated = unavailable = categories_reactivated = active = 0
+    seen_categories: set[int] = set()
+    for snapshot in snapshots:
+        product = await session.get(Product, snapshot.product_id)
+        if product is None:
+            continue
+        available = (
+            product.cost_price is not None
+            and product.cost_price > 0
+            and (snapshot.stock is None or snapshot.stock > 0)
+        )
+        snapshot.activation_locked = False
+        if not available:
+            product.is_active = False
+            unavailable += 1
+            continue
+        active += 1
+        if not product.is_active:
+            product.is_active = True
+            activated += 1
+        if product.category_id not in seen_categories:
+            category = await session.get(Category, product.category_id)
+            if category is not None and not category.is_active:
+                category.is_active = True
+                categories_reactivated += 1
+            seen_categories.add(product.category_id)
+
+    add_audit(
+        session,
+        actor_user_id=actor_user_id,
+        action="supplier.catalog_visibility_repaired_compat",
+        entity_type="supplier",
+        entity_id="ventebot",
+        metadata={
+            "linked": len(snapshots),
+            "active": active,
+            "activated": activated,
+            "unavailable": unavailable,
+            "categories_reactivated": categories_reactivated,
+        },
+    )
+    await session.flush()
+    return SimpleNamespace(
+        linked=len(snapshots),
+        active=active,
+        activated=activated,
+        unavailable=unavailable,
+        categories_reactivated=categories_reactivated,
+    )
 
 
 def build_admin_router(
@@ -575,7 +650,7 @@ def build_admin_router(
                 sync_error = str(exc)[:250]
             finally:
                 await provider.close()
-        repair = await repair_supplier_catalog_visibility(
+        repair = await _repair_supplier_catalog_visibility(
             session,
             actor_user_id=actor_user_id,
         )
@@ -758,7 +833,7 @@ def build_admin_router(
         config.auto_activate = not config.auto_activate
         activated = 0
         if config.auto_activate:
-            repair = await repair_supplier_catalog_visibility(
+            repair = await _repair_supplier_catalog_visibility(
                 session,
                 actor_user_id=callback.from_user.id,
             )
