@@ -3,15 +3,23 @@ from __future__ import annotations
 import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.enums import LedgerKind, PaymentKind, PaymentStatus
-from app.models import JeebPaymentIntent, JeebTransactionEvent, Payment, PaymentChannel
+from app.models import (
+    JeebAmountReservation,
+    JeebPaymentIntent,
+    JeebRelayReceipt,
+    JeebTransactionEvent,
+    Payment,
+    PaymentChannel,
+)
 from app.services.audit import add_audit
 from app.services.payments.binance import BinancePaymentEvent
 from app.services.wallet import WalletMutation, WalletService, money
@@ -38,6 +46,9 @@ class JeebPaymentEvent:
     currency: str
     sender_account: str
     occurred_at: datetime | None = None
+    source_device_id: str | None = None
+    relay_nonce: str | None = None
+    payload_sha256: str | None = None
 
 
 def normalize_jeeb_transaction_id(value: str) -> str:
@@ -62,8 +73,14 @@ def settlement_quantum(currency: str) -> Decimal:
 
 
 class PaymentService:
-    def __init__(self, wallet: WalletService | None = None) -> None:
+    def __init__(
+        self,
+        wallet: WalletService | None = None,
+        *,
+        jeeb_intent_ttl_minutes: int = 30,
+    ) -> None:
         self.wallet = wallet or WalletService()
+        self.jeeb_intent_ttl_minutes = jeeb_intent_ttl_minutes
 
     def quote(self, channel: PaymentChannel, credit_amount: Decimal) -> PaymentQuote:
         credit = money(credit_amount)
@@ -179,6 +196,86 @@ class PaymentService:
         matched_payment, mutation = await self._match_jeeb_event(session, event)
         return matched_payment or payment, mutation
 
+    async def create_jeeb_intent(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: int,
+        channel: PaymentChannel,
+        quote: PaymentQuote,
+        payer_account: str,
+    ) -> Payment:
+        """Reserve a unique YER amount before the customer transfers any money."""
+
+        if channel.code != "jeeb" or channel.kind is not PaymentKind.MANUAL:
+            raise PaymentError("طريقة الدفع ليست محفظة جيب")
+        payer_account = normalize_jeeb_account(payer_account)
+        if not 6 <= len(payer_account) <= 20:
+            raise PaymentError("رقم حساب/هاتف جيب غير صالح")
+        if quote.settlement_currency.upper() != "YER" or quote.expected_amount < 100:
+            raise PaymentError("اضبط سعر صرف جيب الصحيح من لوحة الأدمن قبل التفعيل")
+
+        now = datetime.now(UTC)
+        await session.execute(
+            delete(JeebAmountReservation).where(JeebAmountReservation.expires_at < now)
+        )
+        offsets = list(range(1, 100))
+        secrets.SystemRandom().shuffle(offsets)
+        actual_amount: Decimal | None = None
+        adjustment: Decimal | None = None
+        reservation: JeebAmountReservation | None = None
+        for offset in offsets:
+            candidate = money(quote.expected_amount + Decimal(offset))
+            candidate_reservation = JeebAmountReservation(
+                reservation_key=f"YER:{format(candidate, 'f')}",
+                payment_id=None,
+                expires_at=now + timedelta(minutes=self.jeeb_intent_ttl_minutes),
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(candidate_reservation)
+                    await session.flush()
+            except IntegrityError:
+                continue
+            actual_amount = candidate
+            adjustment = Decimal(offset)
+            reservation = candidate_reservation
+            break
+        if actual_amount is None or adjustment is None or reservation is None:
+            raise PaymentError("طلبات جيب كثيرة الآن؛ حاول مجددًا بعد دقائق")
+
+        reserved_quote = PaymentQuote(
+            credit_amount=quote.credit_amount,
+            expected_amount=actual_amount,
+            credit_currency=quote.credit_currency,
+            settlement_currency=quote.settlement_currency,
+            fee_percent=quote.fee_percent,
+            rate=quote.rate,
+        )
+        payment = await self.create_pending(
+            session,
+            user_id=user_id,
+            channel=channel,
+            quote=reserved_quote,
+            allow_unproved_manual=True,
+        )
+        reservation.payment_id = payment.id
+        session.add(JeebPaymentIntent(payment_id=payment.id, payer_account=payer_account))
+        add_audit(
+            session,
+            actor_user_id=user_id,
+            action="payment.jeeb_intent_created",
+            entity_type="payment",
+            entity_id=str(payment.id),
+            metadata={
+                "public_code": payment.public_code,
+                "matching_adjustment_yer": str(adjustment),
+                "ttl_minutes": self.jeeb_intent_ttl_minutes,
+            },
+        )
+        await session.flush()
+        return payment
+
     async def receive_jeeb_event(
         self,
         session: AsyncSession,
@@ -194,6 +291,27 @@ class PaymentService:
             raise PaymentError("Invalid Jeeb sender account")
         if amount <= 0 or len(currency) > 8:
             raise PaymentError("Invalid Jeeb amount or currency")
+        if event.source_device_id is not None and event.occurred_at is None:
+            raise PaymentError("Signed Jeeb events must include occurred_at")
+
+        if event.relay_nonce:
+            receipt = await session.scalar(
+                select(JeebRelayReceipt)
+                .where(JeebRelayReceipt.nonce == event.relay_nonce)
+                .with_for_update()
+            )
+            if receipt is not None:
+                if (
+                    receipt.transaction_id != transaction_id
+                    or receipt.payload_sha256 != event.payload_sha256
+                    or receipt.source_device_id != event.source_device_id
+                ):
+                    raise PaymentError("Conflicting replay of a Jeeb relay request")
+                replayed_event = await session.get(JeebTransactionEvent, transaction_id)
+                if replayed_event is None:
+                    raise PaymentError("Incomplete Jeeb relay receipt")
+                payment, mutation = await self._match_jeeb_event(session, replayed_event)
+                return replayed_event, payment, mutation
 
         stored = await session.scalar(
             select(JeebTransactionEvent)
@@ -216,6 +334,16 @@ class PaymentService:
             or stored.sender_account != sender_account
         ):
             raise PaymentError("Conflicting replay of a Jeeb transaction")
+        if event.relay_nonce:
+            session.add(
+                JeebRelayReceipt(
+                    nonce=event.relay_nonce,
+                    source_device_id=event.source_device_id or "unknown",
+                    payload_sha256=event.payload_sha256 or "",
+                    transaction_id=transaction_id,
+                )
+            )
+            await session.flush()
 
         payment, mutation = await self._match_jeeb_event(session, stored)
         return stored, payment, mutation
@@ -249,6 +377,41 @@ class PaymentService:
             )
             .with_for_update()
         )
+        if payment is None:
+            cutoff = datetime.now(UTC) - timedelta(minutes=self.jeeb_intent_ttl_minutes)
+            event_time = event.occurred_at or datetime.now(UTC)
+            candidates = list(
+                await session.scalars(
+                    select(Payment)
+                    .join(JeebPaymentIntent, JeebPaymentIntent.payment_id == Payment.id)
+                    .where(
+                        Payment.channel_code == "jeeb",
+                        Payment.status == PaymentStatus.PENDING,
+                        Payment.expected_amount == event.amount,
+                        Payment.settlement_currency == event.currency,
+                        JeebPaymentIntent.payer_account == event.sender_account,
+                        Payment.created_at >= cutoff,
+                        Payment.created_at <= event.created_at,
+                        Payment.created_at <= event_time + timedelta(minutes=2),
+                    )
+                    .order_by(Payment.created_at.desc())
+                    .limit(2)
+                    .with_for_update()
+                )
+            )
+            if len(candidates) > 1:
+                add_audit(
+                    session,
+                    actor_user_id=None,
+                    action="payment.jeeb_ambiguous_event",
+                    entity_type="jeeb_transaction",
+                    entity_id=event.transaction_id,
+                    metadata={"candidate_count": len(candidates)},
+                )
+                return None, None
+            if len(candidates) == 1:
+                payment = candidates[0]
+                payment.payer_reference = event.transaction_id
         if payment is None:
             return None, None
         intent = await session.get(JeebPaymentIntent, payment.id)
