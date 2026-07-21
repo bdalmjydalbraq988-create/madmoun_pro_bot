@@ -7,17 +7,17 @@ android {
     compileSdk 35
 
     defaultConfig {
-        // A distinct package avoids signature conflicts with any earlier test build.
-        applicationId "com.madhmoun.jeebrelay.compat"
-        minSdk 23
+        // Keep the Android 5 build separate from every previous test package/signature.
+        applicationId "com.madhmoun.jeebrelay.legacy"
+        minSdk 21
         targetSdk 35
-        versionCode 2
-        versionName "1.0.1"
+        versionCode 3
+        versionName "1.0.2"
     }
 
     signingConfigs {
         debug {
-            // Android 6 and vendor package installers still require a V1 signature.
+            // Android 5 and vendor package installers still require a V1 signature.
             enableV1Signing = true
             enableV2Signing = true
             enableV3Signing = true
