@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     jeeb_relay_secret: SecretStr = SecretStr("")
     jeeb_relay_device_id: str = ""
     jeeb_relay_tolerance_seconds: int = 300
+    # Google Play fallback for phones that reject a sideloaded relay APK.
+    jeeb_macrodroid_relay_enabled: bool = False
+    jeeb_macrodroid_relay_token: SecretStr = SecretStr("")
     jeeb_event_max_age_hours: int = 24
     jeeb_intent_ttl_minutes: int = 30
 
@@ -91,10 +94,27 @@ class Settings(BaseSettings):
                 raise ValueError("BINANCE_PAY_API_KEY is required when Binance Pay is enabled")
             if not self.binance_pay_secret_key.get_secret_value():
                 raise ValueError("BINANCE_PAY_SECRET_KEY is required when Binance Pay is enabled")
-        if self.jeeb_auto_confirm_enabled and len(self.jeeb_relay_secret.get_secret_value()) < 32:
+        hmac_relay_ready = len(self.jeeb_relay_secret.get_secret_value()) >= 32
+        macrodroid_relay_ready = (
+            self.jeeb_macrodroid_relay_enabled
+            and len(self.jeeb_macrodroid_relay_token.get_secret_value()) >= 48
+        )
+        if self.jeeb_macrodroid_relay_enabled:
+            if len(self.jeeb_macrodroid_relay_token.get_secret_value()) < 48:
+                raise ValueError(
+                    "JEEB_MACRODROID_RELAY_TOKEN must have at least 48 characters "
+                    "when the MacroDroid relay is enabled"
+                )
+            if not self.jeeb_relay_device_id:
+                raise ValueError(
+                    "JEEB_RELAY_DEVICE_ID is required when the MacroDroid relay is enabled"
+                )
+        if self.jeeb_auto_confirm_enabled and not (
+            hmac_relay_ready or macrodroid_relay_ready
+        ):
             raise ValueError(
-                "JEEB_RELAY_SECRET must have at least 32 characters "
-                "when Jeeb auto confirm is enabled"
+                "Configure either JEEB_RELAY_SECRET (32+ characters) or the "
+                "MacroDroid relay before enabling Jeeb auto confirmation"
             )
         if self.jeeb_auto_confirm_enabled:
             if not self.jeeb_relay_device_id:

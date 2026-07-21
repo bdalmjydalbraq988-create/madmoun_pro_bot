@@ -25,6 +25,12 @@ from app.models import Base, LedgerEntry, Order, Referral
 from app.services.delivery import delivery_html, is_placeholder_delivery
 from app.services.orders import OrderProcessor, OrderService
 from app.services.payments.binance import BinancePayClient
+from app.services.payments.jeeb_macrodroid import (
+    JeebNotificationParseError,
+    parse_jeeb_notification,
+    unpack_macrodroid_notification,
+    verify_macrodroid_relay_request,
+)
 from app.services.payments.jeeb_relay import JeebRelayAuthError, verify_jeeb_relay_request
 from app.services.payments.service import JeebPaymentEvent, PaymentError, PaymentService
 from app.services.providers.quantumvault import VenteBotProvider
@@ -328,6 +334,8 @@ async def jeeb_notification_relay(
     settings = app.state.settings
     if not settings.jeeb_auto_confirm_enabled:
         raise HTTPException(status_code=503, detail="Jeeb auto confirmation is disabled")
+    if len(settings.jeeb_relay_secret.get_secret_value()) < 32:
+        raise HTTPException(status_code=503, detail="Signed Android relay is not configured")
     raw_body = await request.body()
     if len(raw_body) > 4096:
         raise HTTPException(status_code=413, detail="Relay payload is too large")
@@ -411,6 +419,135 @@ async def jeeb_notification_relay(
         "ok": True,
         "matched": payment is not None,
         "status": payment.status.value if payment is not None else "awaiting_customer_claim",
+    }
+
+
+@app.post("/webhooks/jeeb-macrodroid", include_in_schema=False)
+async def jeeb_macrodroid_relay(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_jeeb_device_id: str | None = Header(default=None),
+) -> dict[str, bool | str]:
+    """Accept only Jeeb notifications forwarded by the Google Play relay.
+
+    The endpoint intentionally accepts plain text so MacroDroid cannot create
+    malformed JSON by interpolating Arabic notification text. Parsing and all
+    financial matching remain server-side.
+    """
+
+    settings = app.state.settings
+    if not settings.jeeb_macrodroid_relay_enabled:
+        raise HTTPException(status_code=503, detail="MacroDroid relay is disabled")
+    content_type = request.headers.get("content-type", "").lower()
+    if not content_type.startswith("text/plain"):
+        raise HTTPException(status_code=415, detail="Relay content type must be text/plain")
+    raw_body = await request.body()
+    if not 1 <= len(raw_body) <= 12_000:
+        raise HTTPException(status_code=413, detail="Relay payload is too large")
+    try:
+        verified = verify_macrodroid_relay_request(
+            token=settings.jeeb_macrodroid_relay_token.get_secret_value(),
+            expected_device_id=settings.jeeb_relay_device_id,
+            authorization=authorization,
+            device_id=x_jeeb_device_id,
+            body=raw_body,
+        )
+        _, raw_notification = unpack_macrodroid_notification(raw_body)
+        parsed = parse_jeeb_notification(raw_notification)
+    except (JeebRelayAuthError, JeebNotificationParseError) as exc:
+        logger.warning("Rejected MacroDroid Jeeb relay request: %s", exc)
+        status_code = 401 if isinstance(exc, JeebRelayAuthError) else 422
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    # Safe commissioning mode: prove notification capture and parsing before
+    # allowing any database event or wallet mutation.
+    if not settings.jeeb_auto_confirm_enabled:
+        bot = app.state.bot
+        if bot is not None:
+            masked_transaction = (
+                "…" + parsed.transaction_id[-6:]
+                if len(parsed.transaction_id) > 6
+                else parsed.transaction_id
+            )
+            masked_sender = "…" + parsed.sender_account[-4:]
+            for admin_id in settings.admin_ids:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        "🧪 <b>نجح اختبار ربط جيب</b>\n"
+                        f"العملية: <code>{masked_transaction}</code>\n"
+                        f"المبلغ: <b>{money_label(parsed.amount, 'YER')}</b>\n"
+                        f"المرسل: <code>{masked_sender}</code>\n\n"
+                        "الوضع اختباري؛ لم يُضف أي رصيد.",
+                    )
+                except Exception:
+                    logger.exception("Could not notify admin about Jeeb relay dry run")
+        return {"ok": True, "matched": False, "status": "validated_only"}
+
+    occurred_at = datetime.now(UTC)
+    async with app.state.session_factory() as session:
+        try:
+            _, payment, mutation = await app.state.payment_service.receive_jeeb_event(
+                session,
+                JeebPaymentEvent(
+                    transaction_id=parsed.transaction_id,
+                    amount=parsed.amount,
+                    currency="YER",
+                    sender_account=parsed.sender_account,
+                    occurred_at=occurred_at,
+                    source_device_id=verified.device_id,
+                    relay_nonce=verified.nonce,
+                    payload_sha256=verified.body_sha256,
+                ),
+            )
+            await session.commit()
+        except PaymentError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if payment is not None and mutation is not None and not mutation.was_replayed:
+        bot = app.state.bot
+        if bot is not None:
+            try:
+                await bot.send_message(
+                    payment.user_id,
+                    f"✅ تم تأكيد شحن جيب <code>{payment.public_code}</code> تلقائيًا.\n"
+                    f"الرصيد الجديد: <b>{money_label(mutation.balance_after)}</b>",
+                )
+            except Exception:
+                logger.exception("Could not notify customer about confirmed Jeeb payment")
+    elif payment is not None and payment.status.value == "review_required":
+        bot = app.state.bot
+        if bot is not None:
+            try:
+                await bot.send_message(
+                    payment.user_id,
+                    f"⚠️ شحن جيب <code>{payment.public_code}</code> لم يطابق جميع البيانات. "
+                    "لم يُضف أي رصيد وأُرسل الطلب للمراجعة.",
+                )
+                for admin_id in settings.admin_ids:
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ شحن جيب <code>{payment.public_code}</code> يحتاج مراجعة. "
+                        "لم تتم إضافة الرصيد تلقائيًا.",
+                    )
+            except Exception:
+                logger.exception("Could not notify about Jeeb payment mismatch")
+    return {
+        "ok": True,
+        "matched": payment is not None,
+        "status": payment.status.value if payment is not None else "awaiting_customer_claim",
+    }
+
+
+@app.get("/webhooks/jeeb-macrodroid/health", include_in_schema=False)
+async def jeeb_macrodroid_health() -> dict[str, bool | str]:
+    settings = app.state.settings
+    return {
+        "ok": True,
+        "relay_enabled": settings.jeeb_macrodroid_relay_enabled,
+        "auto_confirm_enabled": settings.jeeb_auto_confirm_enabled,
+        "protocol": "bearer-tls-body-digest-v1",
     }
 
 
